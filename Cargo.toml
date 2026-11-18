@@ -1,0 +1,35 @@
+[package]
+name = "audio-commun"
+description = "Capture du son de Windows (WASAPI loopback) et analyses partagées par Prisme, Horizon et Essaim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[features]
+default = ["capture", "spectre"]
+# Capture loopback de la sortie par défaut (Windows seulement).
+capture = ["dep:wasapi", "dep:windows", "dep:anyhow"]
+# Analyse spectrale (FFT) : bandes mel, attaques, tempo, intensité, tonalité.
+spectre = ["dep:realfft"]
+
+[dependencies]
+log = "0.4"
+anyhow = { version = "1", optional = true }
+wasapi = { version = "0.26", optional = true }
+realfft = { version = "3.5", optional = true }
+
+[dependencies.windows]
+version = "0.62"
+optional = true
+features = ["Win32_Foundation", "Win32_System_Threading"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# La sonde lit le son réel : elle a besoin de la capture.
+[[example]]
+name = "kick_probe"
+required-features = ["capture"]
