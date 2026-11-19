@@ -1,7 +1,8 @@
 //! Capture d'une sortie son (WASAPI loopback, mode événement).
 //!
 //! Un fil dédié ouvre la sortie voulue en loopback (f32 stéréo convertie par Windows, puis
-//! mélangée en mono), et remet chaque paquet au [`Sink`] dès son arrivée. Sans son, Windows
+//! mélangée en mono), et remet chaque paquet au [`Sink`] dès son arrivée, avec le niveau de
+//! chaque canal ([`Sink::stereo`]). Sans son, Windows
 //! n'envoie aucun paquet : du silence est injecté pour la durée écoulée, afin que les niveaux
 //! retombent. La sortie est revérifiée toutes les 2 s ; si elle change ou si une erreur
 //! survient, le flux est rouvert 1 s plus tard. Le fil est inscrit auprès de MMCSS
@@ -31,6 +32,9 @@ pub trait Sink: Send + 'static {
     fn tick(&mut self, now: Instant) -> Duration;
     /// Le flux est perdu (erreur, sortie changée) ; un nouvel essai suit.
     fn lost(&mut self);
+    /// Niveaux efficaces (RMS) des canaux gauche et droit du paquet qui vient d'être remis à
+    /// [`Sink::samples`] : de quel côté joue le son. Rien par défaut.
+    fn stereo(&mut self, _gauche: f32, _droite: f32) {}
 }
 
 /// Capture en cours ; l'arrêter = la `drop` (au plus ~20 ms d'attente).
@@ -298,20 +302,29 @@ fn drain(
         if info.flags.silent {
             sink.silence(frames);
         } else {
-            mix_mono(&bytes[..frames * 8], &mut mono[..frames]);
+            let (gauche, droite) = mix_mono(&bytes[..frames * 8], &mut mono[..frames]);
             sink.samples(&mono[..frames]);
+            sink.stereo(gauche, droite);
         }
     }
     Ok(())
 }
 
-/// Stéréo f32 entrelacée (octets little-endian) → mono.
-fn mix_mono(stereo: &[u8], mono: &mut [f32]) {
+/// Stéréo f32 entrelacée (octets little-endian) → mono ; renvoie le niveau efficace (RMS) de
+/// chaque canal (gauche, droite). Les valeurs non finies ne comptent pas dans les niveaux.
+fn mix_mono(stereo: &[u8], mono: &mut [f32]) -> (f32, f32) {
+    let (mut sl, mut sr, mut n) = (0.0f32, 0.0f32, 0usize);
     for (m, fr) in mono.iter_mut().zip(stereo.chunks_exact(8)) {
         let l = f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]);
         let r = f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]);
         *m = 0.5 * (l + r);
+        if l.is_finite() && r.is_finite() {
+            (sl, sr) = (sl + l * l, sr + r * r);
+        }
+        n += 1;
     }
+    let n = n.max(1) as f32;
+    ((sl / n).sqrt(), (sr / n).sqrt())
 }
 
 /// Inscription du fil auprès du planificateur multimédia (MMCSS, tâche « Pro Audio »), retirée
@@ -425,7 +438,10 @@ mod tests {
             stereo.extend_from_slice(&r.to_le_bytes());
         }
         let mut mono = [9.0f32; 3];
-        mix_mono(&stereo, &mut mono);
+        let (g, d) = mix_mono(&stereo, &mut mono);
         assert_eq!(mono, [0.5, 0.0, -1.0]);
+        // niveaux efficaces : √((1 + 0,25 + 1) / 3) à gauche, √((0 + 0,25 + 1) / 3) à droite
+        assert!((g - (2.25f32 / 3.0).sqrt()).abs() < 1e-6, "{g}");
+        assert!((d - (1.25f32 / 3.0).sqrt()).abs() < 1e-6, "{d}");
     }
 }

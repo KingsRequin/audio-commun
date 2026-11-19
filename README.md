@@ -44,6 +44,12 @@ sorties actives, `(identifiant, nom affiché)`, et `Sortie::depuis_id("")` donne
 pour un réglage vide). Si la sortie choisie disparaît, la capture se replie sur la sortie par défaut et revient
 sur la choisie dès qu'elle est de nouveau active (vérification toutes les 2 s, comme la sortie par défaut).
 
+## Niveaux stéréo (`capture`)
+
+Le son est remis au `Sink` en mono, mais `Sink::stereo(gauche, droite)` reçoit après chaque paquet le niveau
+efficace (RMS) de chaque canal : de quel côté joue le son. Méthode facultative (vide par défaut) ; Essaim
+s'en sert pour pousser l'essaim vers le côté qui joue le plus fort.
+
 ## Tempo des kicks (`pulsation`, 0.2.0)
 
 `Pulsation` déduit le tempo des seuls instants des kicks, pour une application qui n'a pas la FFT
