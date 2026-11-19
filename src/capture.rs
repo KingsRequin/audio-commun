@@ -347,6 +347,41 @@ impl Drop for Mmcss {
 mod tests {
     use super::{mix_mono, suivi, Sortie, Suivi};
 
+    /// Essai sur les vraies sorties de la machine :
+    /// `cargo test --release sorties_reelles -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sorties_reelles() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        struct Compte(Arc<AtomicU32>);
+        impl super::Sink for Compte {
+            fn open(&mut self, _: u32) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn samples(&mut self, _: &[f32]) {}
+            fn silence(&mut self, _: usize) {}
+            fn tick(&mut self, _: std::time::Instant) -> std::time::Duration {
+                std::time::Duration::from_millis(10)
+            }
+            fn lost(&mut self) {}
+        }
+        let liste = super::sorties();
+        println!("{liste:#?}");
+        assert!(!liste.is_empty(), "aucune sortie active");
+        // la dernière sortie listée, puis une sortie inconnue (repli sur la sortie par défaut)
+        for sortie in [
+            Sortie::Id(liste[liste.len() - 1].0.clone()),
+            Sortie::Id("{inconnue}".into()),
+        ] {
+            let ouvertures = Arc::new(AtomicU32::new(0));
+            let c = super::start_sur("essai", sortie.clone(), Compte(ouvertures.clone())).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            drop(c);
+            assert_eq!(ouvertures.load(Ordering::Relaxed), 1, "{sortie:?}");
+        }
+    }
+
     #[test]
     fn identifiant_vide_veut_dire_sortie_par_defaut() {
         assert_eq!(Sortie::depuis_id(""), Sortie::ParDefaut);
