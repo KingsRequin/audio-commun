@@ -11,9 +11,10 @@ captures quasi identiques, deux analyses spectrales qui divergeaient).
 
 | Module | Feature | Contenu | Utilisé par |
 |---|---|---|---|
-| `capture` | `capture` | Loopback WASAPI de la sortie par défaut, mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
+| `capture` | `capture` | Loopback WASAPI de la sortie par défaut ou d'une sortie choisie, mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
 | `spectre` | `spectre` | FFT : bandes mel, graves/médiums/aigus, attaques kick/snare/hihat, tempo + PLL, intensité, drops, tonalité ; `spectre::start` = capture + analyse à cadence fixe | Prisme, Horizon |
 | `kick` | (toujours) | Grosse caisse à 15–30 ms de délai (biquads sur 5 bandes + petit réseau appris, sans FFT), niveau et hauteur de la basse | Essaim |
+| `pulsation` | (toujours) | Tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans FFT ; relais pendant un passage sans kick | Essaim |
 
 Chaque application garde **sa propre capture** : faire passer l'analyse d'un processus à l'autre ajouterait
 du délai (Essaim vise 10–20 ms) et ferait dépendre une application du lancement d'une autre, pour un gain
@@ -23,8 +24,8 @@ négligeable (une capture loopback lit le mélange déjà calculé par Windows).
 
 ```toml
 # Cargo.toml de l'application
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.1.0" }  # tout
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.1.0", default-features = false, features = ["capture"] }  # Essaim
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.2.0" }  # tout
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.2.0", default-features = false, features = ["capture"] }  # Essaim
 ```
 
 Pour la modifier en même temps qu'une application, la cloner à côté et la désigner dans le
@@ -34,6 +35,35 @@ Pour la modifier en même temps qu'une application, la cloner à côté et la d�
 [patch."https://github.com/KingsRequin/audio-commun"]
 audio-commun = { path = "../audio-commun" }
 ```
+
+## Sortie écoutée (`capture`, 0.2.0)
+
+`capture::start(nom, sink)` écoute la sortie par défaut de Windows et suit ses changements (inchangé).
+`capture::start_sur(nom, Sortie::Id(id), sink)` écoute une sortie précise ; `capture::sorties()` liste les
+sorties actives, `(identifiant, nom affiché)`, et `Sortie::depuis_id("")` donne `Sortie::ParDefaut` (pratique
+pour un réglage vide). Si la sortie choisie disparaît, la capture se replie sur la sortie par défaut et revient
+sur la choisie dès qu'elle est de nouveau active (vérification toutes les 2 s, comme la sortie par défaut).
+
+## Tempo des kicks (`pulsation`, 0.2.0)
+
+`Pulsation` déduit le tempo des seuls instants des kicks, pour une application qui n'a pas la FFT
+(`spectre::tempo` demande le flux spectral). À chaque kick, les tempos de 70 à 180 BPM (pas de 0,5) sont
+essayés : alignement des phases des kicks des 8 dernières secondes × part des temps de la grille qui ont leur
+kick (ce produit écarte le double et la moitié du tempo), puis ajustement par moindres carrés (période et
+origine). Grille retenue seulement si les kicks sont réguliers (8 kicks au moins, 80 % sur la grille, écart
+type sous 4 % de la période, 60 % des temps marqués) ; tempo annoncé après trois estimations concordantes.
+Gardé pendant un passage sans kick tant que la musique joue (30 s au plus), oublié après 3 s de silence ;
+`relais(t)` dit quand prendre le relais des kicks (tempo connu, musique, aucun kick depuis 2 s).
+
+```rust
+let mut p = audio_commun::pulsation::Pulsation::new();
+p.kick(t);                 // à chaque kick (t en secondes, horloge croissante)
+p.avancer(t, audible);     // régulièrement
+p.bpm(); p.phase(t); p.relais(t);
+```
+
+Tests sur signaux synthétiques : kicks réguliers à 74, 90, 120, 128 et 174 BPM avec ±12 ms de gigue → tempo à
+±1 BPM ; 200 suites de kicks irréguliers → aucun tempo ; silence → aucun tempo.
 
 ## Vérification
 
