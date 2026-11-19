@@ -1,11 +1,16 @@
-//! Capture de la sortie son par défaut (WASAPI loopback, mode événement).
+//! Capture d'une sortie son (WASAPI loopback, mode événement).
 //!
-//! Un fil dédié ouvre la sortie par défaut en loopback (f32 stéréo convertie par Windows, puis
+//! Un fil dédié ouvre la sortie voulue en loopback (f32 stéréo convertie par Windows, puis
 //! mélangée en mono), et remet chaque paquet au [`Sink`] dès son arrivée. Sans son, Windows
 //! n'envoie aucun paquet : du silence est injecté pour la durée écoulée, afin que les niveaux
-//! retombent. La sortie par défaut est revérifiée toutes les 2 s ; si elle change ou si une
-//! erreur survient, le flux est rouvert 1 s plus tard. Le fil est inscrit auprès de MMCSS
+//! retombent. La sortie est revérifiée toutes les 2 s ; si elle change ou si une erreur
+//! survient, le flux est rouvert 1 s plus tard. Le fil est inscrit auprès de MMCSS
 //! (« Pro Audio ») pour être réveillé à l'heure même quand la machine est chargée.
+//!
+//! Sortie écoutée ([`Sortie`]) : celle par défaut de Windows (ses changements sont suivis), ou
+//! une sortie précise choisie dans [`sorties`]. Si la sortie choisie disparaît (casque
+//! débranché, carte désactivée), la capture se replie sur la sortie par défaut et revient sur
+//! la choisie dès qu'elle est de nouveau active (vérifié toutes les 2 s).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,13 +48,71 @@ impl Drop for Capture {
     }
 }
 
-/// Lance la capture dans un fil nommé `name`.
+/// Sortie son écoutée.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Sortie {
+    /// La sortie par défaut de Windows, suivie quand elle change.
+    #[default]
+    ParDefaut,
+    /// Une sortie précise, par son identifiant Windows (voir [`sorties`]).
+    Id(String),
+}
+
+impl Sortie {
+    /// Identifiant tel que rangé dans des réglages : vide = sortie par défaut.
+    pub fn depuis_id(id: &str) -> Self {
+        let id = id.trim();
+        if id.is_empty() {
+            Self::ParDefaut
+        } else {
+            Self::Id(id.to_owned())
+        }
+    }
+}
+
+/// Sorties son actives de Windows, `(identifiant, nom affiché)`, dans l'ordre de Windows ;
+/// liste vide si Windows ne répond pas. Appelable depuis n'importe quel fil : COM y est
+/// initialisé au besoin (et laissé tel quel s'il l'était déjà, en STA par exemple).
+pub fn sorties() -> Vec<(String, String)> {
+    let init = wasapi::initialize_mta();
+    let liste = lire_sorties().unwrap_or_else(|e| {
+        log::warn!("audio : liste des sorties illisible : {e:#}");
+        Vec::new()
+    });
+    // S_OK ou S_FALSE : ce fil a pris une référence COM, à rendre. Échec (fil déjà dans un
+    // autre appartement) : rien à rendre.
+    if init.is_ok() {
+        wasapi::deinitialize();
+    }
+    liste
+}
+
+fn lire_sorties() -> anyhow::Result<Vec<(String, String)>> {
+    let enumerator = DeviceEnumerator::new()?;
+    let collection = enumerator.get_device_collection(&Direction::Render)?;
+    let mut liste = Vec::new();
+    for device in &collection {
+        let device = device?;
+        let id = device.get_id()?;
+        let nom = device.get_friendlyname().unwrap_or_else(|_| id.clone());
+        liste.push((id, nom));
+    }
+    Ok(liste)
+}
+
+/// Lance la capture de la sortie par défaut dans un fil nommé `name`.
 pub fn start(name: &str, sink: impl Sink) -> std::io::Result<Capture> {
+    start_sur(name, Sortie::ParDefaut, sink)
+}
+
+/// Lance la capture de `sortie` dans un fil nommé `name` (sur la sortie par défaut tant que
+/// la sortie choisie est absente).
+pub fn start_sur(name: &str, sortie: Sortie, sink: impl Sink) -> std::io::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let thread = std::thread::Builder::new()
         .name(name.into())
-        .spawn(move || run(sink, &s))?;
+        .spawn(move || run(sink, &sortie, &s))?;
     Ok(Capture {
         stop,
         thread: Some(thread),
@@ -58,14 +121,14 @@ pub fn start(name: &str, sink: impl Sink) -> std::io::Result<Capture> {
 
 /// Au-delà, l'absence de paquet veut dire que rien n'est joué.
 const NO_DATA: Duration = Duration::from_millis(30);
-/// Vérification de la sortie par défaut (changement de casque, d'enceintes…).
+/// Vérification de la sortie (changement de casque, d'enceintes, retour de la sortie choisie).
 const DEVICE_CHECK: Duration = Duration::from_secs(2);
 /// Plus longue attente d'un paquet : borne aussi le délai d'arrêt.
 const MAX_WAIT_MS: u128 = 20;
 /// Erreurs répétées : une ligne de journal toutes les 30 s au plus.
 const ERROR_LOG: Duration = Duration::from_secs(30);
 
-fn run(mut sink: impl Sink, stop: &AtomicBool) {
+fn run(mut sink: impl Sink, sortie: &Sortie, stop: &AtomicBool) {
     if wasapi::initialize_mta().is_err() {
         log::warn!("audio : initialisation COM impossible");
     }
@@ -73,10 +136,14 @@ fn run(mut sink: impl Sink, stop: &AtomicBool) {
     let mut last_error_log: Option<Instant> = None;
     let mut hidden = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = stream(&mut sink, stop) {
+        if let Err(e) = stream(&mut sink, sortie, stop) {
             let now = Instant::now();
             if last_error_log.is_none_or(|t| now.duration_since(t) >= ERROR_LOG) {
-                let masked = if hidden > 0 { format!(" ({hidden} masquées)") } else { String::new() };
+                let masked = if hidden > 0 {
+                    format!(" ({hidden} masquées)")
+                } else {
+                    String::new()
+                };
                 log::warn!("audio : capture interrompue : {e:#}{masked}, nouvel essai");
                 last_error_log = Some(now);
                 hidden = 0;
@@ -96,10 +163,43 @@ fn run(mut sink: impl Sink, stop: &AtomicBool) {
     wasapi::deinitialize();
 }
 
-/// Une session de capture sur la sortie par défaut. `Ok` = arrêt demandé ; `Err` = à relancer.
-fn stream(sink: &mut impl Sink, stop: &AtomicBool) -> anyhow::Result<()> {
+/// La sortie `id` existe-t-elle et est-elle active ?
+fn active(enumerator: &DeviceEnumerator, id: &str) -> bool {
+    enumerator
+        .get_device(id)
+        .and_then(|d| d.get_state())
+        .is_ok_and(|s| matches!(s, wasapi::DeviceState::Active))
+}
+
+/// Ce que surveille une session ouverte : la sortie par défaut (suivie, ou repli faute de la
+/// sortie choisie), ou la sortie choisie elle-même.
+#[derive(Debug, PartialEq, Eq)]
+enum Suivi<'a> {
+    Defaut { choisie_absente: Option<&'a str> },
+    Choisie(&'a str),
+}
+
+/// Sortie à ouvrir : la choisie si elle est active, sinon celle par défaut.
+fn suivi<'a>(sortie: &'a Sortie, choisie_active: impl FnOnce(&str) -> bool) -> Suivi<'a> {
+    match sortie {
+        Sortie::ParDefaut => Suivi::Defaut {
+            choisie_absente: None,
+        },
+        Sortie::Id(id) if choisie_active(id) => Suivi::Choisie(id),
+        Sortie::Id(id) => Suivi::Defaut {
+            choisie_absente: Some(id),
+        },
+    }
+}
+
+/// Une session de capture. `Ok` = arrêt demandé ; `Err` = à relancer.
+fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::Result<()> {
     let enumerator = DeviceEnumerator::new()?;
-    let device = enumerator.get_default_device(&Direction::Render)?;
+    let suivi = suivi(sortie, |id| active(&enumerator, id));
+    let device = match suivi {
+        Suivi::Choisie(id) => enumerator.get_device(id)?,
+        Suivi::Defaut { .. } => enumerator.get_default_device(&Direction::Render)?,
+    };
     let device_id = device.get_id()?;
     let mut client = device.get_iaudioclient()?;
     let sample_rate = client.get_mixformat()?.get_samplespersec();
@@ -120,8 +220,18 @@ fn stream(sink: &mut impl Sink, stop: &AtomicBool) -> anyhow::Result<()> {
     let mut mono = vec![0.0f32; frames_max];
     sink.open(sample_rate);
     client.start_stream()?;
+    let repli = if matches!(
+        suivi,
+        Suivi::Defaut {
+            choisie_absente: Some(_)
+        }
+    ) {
+        " ; sortie choisie absente, sortie par défaut en attendant"
+    } else {
+        ""
+    };
     log::info!(
-        "audio : loopback ouvert sur « {} » ({sample_rate} Hz)",
+        "audio : loopback ouvert sur « {} » ({sample_rate} Hz){repli}",
         device.get_friendlyname().unwrap_or_default()
     );
 
@@ -151,11 +261,23 @@ fn stream(sink: &mut impl Sink, stop: &AtomicBool) -> anyhow::Result<()> {
         wait = sink.tick(now);
         if now.duration_since(device_checked) >= DEVICE_CHECK {
             device_checked = now;
-            let current = enumerator
-                .get_default_device(&Direction::Render)
-                .and_then(|d| d.get_id());
-            if current.as_deref().ok() != Some(device_id.as_str()) {
-                break Err(anyhow::anyhow!("sortie son par défaut changée"));
+            match suivi {
+                Suivi::Choisie(id) => {
+                    if !active(&enumerator, id) {
+                        break Err(anyhow::anyhow!("sortie choisie disparue"));
+                    }
+                }
+                Suivi::Defaut { choisie_absente } => {
+                    if choisie_absente.is_some_and(|id| active(&enumerator, id)) {
+                        break Err(anyhow::anyhow!("sortie choisie de nouveau active"));
+                    }
+                    let current = enumerator
+                        .get_default_device(&Direction::Render)
+                        .and_then(|d| d.get_id());
+                    if current.as_deref().ok() != Some(device_id.as_str()) {
+                        break Err(anyhow::anyhow!("sortie son par défaut changée"));
+                    }
+                }
             }
         }
     };
@@ -215,14 +337,50 @@ impl Drop for Mmcss {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
             // SAFETY: poignée rendue par AvSetMmThreadCharacteristicsW sur ce même fil.
-            let _ = unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(h) };
+            let _ =
+                unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(h) };
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mix_mono;
+    use super::{mix_mono, suivi, Sortie, Suivi};
+
+    #[test]
+    fn identifiant_vide_veut_dire_sortie_par_defaut() {
+        assert_eq!(Sortie::depuis_id(""), Sortie::ParDefaut);
+        assert_eq!(Sortie::depuis_id("  "), Sortie::ParDefaut);
+        assert_eq!(
+            Sortie::depuis_id("{0.0.0}.{abc}"),
+            Sortie::Id("{0.0.0}.{abc}".into())
+        );
+    }
+
+    #[test]
+    fn sortie_choisie_absente_repli_sur_la_sortie_par_defaut() {
+        let choisie = Sortie::Id("casque".into());
+        assert_eq!(suivi(&choisie, |_| true), Suivi::Choisie("casque"));
+        assert_eq!(
+            suivi(&choisie, |_| false),
+            Suivi::Defaut {
+                choisie_absente: Some("casque")
+            }
+        );
+        // sortie par défaut : aucune sortie choisie à vérifier
+        let mut demande = false;
+        let s = suivi(&Sortie::ParDefaut, |_| {
+            demande = true;
+            true
+        });
+        assert_eq!(
+            s,
+            Suivi::Defaut {
+                choisie_absente: None
+            }
+        );
+        assert!(!demande);
+    }
 
     #[test]
     fn mono_est_la_moyenne_des_deux_canaux() {
