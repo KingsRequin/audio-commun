@@ -11,6 +11,10 @@
 //! (part des kicks détectés qui sont vrais), le rappel (part des vrais kicks trouvés), le score
 //! F1, le délai médian et les faux kicks dans l'intro (avant le premier vrai kick).
 //!
+//! Si `<nom>.kicks_doute` existe (instants où la référence est incertaine), une détection qui y
+//! tombe ne compte ni juste ni fausse ; de même `<nom>.caisses_doute`. Un dossier sans aucun kick
+//! de référence (voix, musique sans batterie) se lit en faux kicks par minute.
+//!
 //! Si `<nom>.caisses` existe (instants des vraies caisses claires), les caisses claires
 //! détectées sont jugées de même ; leur total est affiché à la fin.
 
@@ -72,11 +76,14 @@ fn read_times(path: &Path) -> std::io::Result<Vec<f64>> {
     Ok(v)
 }
 
-fn score(refs: &[f64], hits: &[f64]) -> Score {
+fn score(refs: &[f64], doubt: &[f64], hits: &[f64]) -> Score {
+    // une détection sur un instant douteux (référence incertaine) ne compte ni juste ni fausse
+    let near = |h: f64, r: &[f64]| r.iter().any(|&r| h >= r - BEFORE && h <= r + AFTER);
+    let hits: Vec<f64> = hits.iter().copied().filter(|&h| near(h, refs) || !near(h, doubt)).collect();
     let mut used = vec![false; refs.len()];
     let mut tp = 0;
     let mut delays = Vec::new();
-    for &h in hits {
+    for &h in &hits {
         // vrai kick libre le plus proche dans la fenêtre
         let best = refs
             .iter()
@@ -125,15 +132,20 @@ fn main() -> std::io::Result<()> {
     let mut total = Score { refs: 0, hits: 0, tp: 0, intro_fp: 0, delays: Vec::new() };
     let mut snare_total = Score { refs: 0, hits: 0, tp: 0, intro_fp: 0, delays: Vec::new() };
     let mut f1_sum = 0.0;
+    let (mut seconds, mut compute) = (0.0, 0.0);
     for name in &names {
         let base = Path::new(dir.as_str()).join(name);
         let bytes = std::fs::read(base.with_extension("f32"))?;
         let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         let refs = read_times(&base.with_extension("kicks"))?;
+        let start = std::time::Instant::now();
         let (hits, snares) = detect(&samples, sens, gap);
-        let mut s = score(&refs, &hits);
+        compute += start.elapsed().as_secs_f64();
+        seconds += samples.len() as f64 / SR as f64;
+        let doubt = |ext: &str| read_times(&base.with_extension(ext)).unwrap_or_default();
+        let mut s = score(&refs, &doubt("kicks_doute"), &hits);
         if let Ok(snare_refs) = read_times(&base.with_extension("caisses")) {
-            let mut c = score(&snare_refs, &snares);
+            let mut c = score(&snare_refs, &doubt("caisses_doute"), &snares);
             snare_total.refs += c.refs;
             snare_total.hits += c.hits;
             snare_total.tp += c.tp;
@@ -178,6 +190,14 @@ fn main() -> std::io::Result<()> {
         total.intro_fp
     );
     println!("F1 moyen par morceau : {:.3}", f1_sum / names.len().max(1) as f64);
+    let minutes = seconds / 60.0;
+    println!(
+        "faux par minute : kicks {:.2}, caisses claires {:.2} ({:.0} min ; calcul {:.2} % du temps réel)",
+        (total.hits - total.tp) as f64 / minutes,
+        (snare_total.hits - snare_total.tp) as f64 / minutes,
+        minutes,
+        100.0 * compute / seconds
+    );
     if snare_total.refs > 0 {
         println!(
             "CAISSES CLAIRES : réf {} dét {} préc {:.2} rappel {:.2} F1 {:.3} délai médian {:.0} ms",

@@ -5,21 +5,27 @@
 //! - kick : le son est découpé en 10 bandes (sous 50 Hz, 50–90, 90–140, 140–200, 200–450,
 //!   450 Hz–1 kHz, 1–2 kHz, 2–4 kHz, 4–8 kHz, au-delà ; biquads, pas de FFT) dont on suit le
 //!   niveau en dB tous les 5 ms ; deux bandes voisines forment une des 5 bandes larges (sub,
-//!   90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus). Une attaque candidate est un pic de la montée
-//!   d'énergie des bandes larges (connu 5 ms après l'attaque). Elle est ensuite jugée par un
-//!   petit réseau de neurones (une couche cachée de 32) sur la forme de l'attaque : montée de
-//!   chaque bande, niveau par rapport au morceau, équilibre du spectre, excès du sub sur sa
-//!   moyenne lente. Trois réseaux décident 10, 20 et 30 ms après l'attaque : un kick franc part
-//!   tout de suite, un cas douteux attend d'en entendre plus.
+//!   90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus). Les bandes sous 4 kHz sont calculées sur le son
+//!   sous-échantillonné (~12 kHz de 1 à 4 kHz, ~6 kHz en dessous) : mêmes niveaux, deux fois
+//!   moins de calcul. Une attaque candidate est un pic de la montée d'énergie des bandes larges
+//!   (connu 5 ms après l'attaque). Elle est jugée par un petit réseau de neurones (une couche
+//!   cachée de 32) sur deux choses : la forme de l'attaque (montée de chaque bande, niveau par
+//!   rapport au morceau, équilibre du spectre, excès du sub sur sa moyenne lente) et le
+//!   contexte, c'est-à-dire l'état d'un petit réseau récurrent (GRU) qui lit les niveaux des
+//!   bandes à chaque pas et retient ce qui précède : le rythme, les coups récents, la nature du
+//!   son (musique, voix seule, basse tenue). Trois réseaux décident 10, 20 et 30 ms après
+//!   l'attaque : un kick franc part tout de suite, un cas douteux attend d'en entendre plus.
 //!   Sans kick depuis 4 s (intro, montée, après une pause), le premier doit être franc.
 //!   Les poids (`kick_modele.rs`) sont appris par `scripts/kick_modele.py` sur des morceaux réels
-//!   annotés (MDB Drums, et des morceaux dont la batterie est transcrite par ADTOF).
+//!   annotés (MDB Drums ; morceaux dont la batterie est transcrite par ADTOF), sur ces mêmes
+//!   morceaux rebatterisés (accompagnement réel, batterie refaite avec des sons isolés posés à
+//!   des instants connus) et sur des sons sans batterie (voix, piano, orgue, ambiances).
 //!   Pourquoi pas seulement le sub : en musique électronique, l'attaque du kick est dans les
 //!   médiums et les aigus et le sub n'arrive que 50 à 100 ms plus tard (il commence même par se
 //!   creuser, à cause du sidechain) ; un détecteur de sub y est en retard et confond la basse.
-//! - caisse claire (et claps) : mêmes candidats, mêmes mesures, trois réseaux à elle, mêmes
-//!   seuils qu'un kick à sensibilité 5 ; une attaque peut être à la fois un kick et une caisse
-//!   claire (frappés ensemble). Appris sur les mêmes morceaux (MDB Drums, ADTOF).
+//! - caisse claire (et claps) : mêmes candidats, mêmes mesures, même contexte, trois réseaux à
+//!   elle, mêmes seuils qu'un kick à sensibilité 5 ; une attaque peut être à la fois un kick et
+//!   une caisse claire (frappés ensemble).
 //! - basse : niveau du grave en dB, rapporté au pic récent du morceau (plage fixe de 20 dB).
 //! - hauteur : autocorrélation du grave sous-échantillonné à ~1 kHz, entre 25 et 83 Hz.
 //!
@@ -52,6 +58,16 @@ const BANDS: [(Option<f64>, Option<f64>); NF] = [
 ];
 /// Nombre de bandes fines.
 const NF: usize = 10;
+/// Étage de calcul de chaque bande : 0 = cadence d'origine, 1 = sous-échantillonné de `d1`
+/// (~12 kHz), 2 = encore de 2 (~6 kHz). Une bande grave n'a pas besoin de 48 000 échantillons
+/// par seconde : calculée à 6 kHz, elle coûte 8 fois moins.
+const BAND_STAGE: [usize; NF] = [2, 2, 2, 2, 2, 2, 1, 1, 0, 0];
+/// Facteurs de qualité des trois biquads d'un passe-bas de Butterworth d'ordre 6 (avant chaque
+/// sous-échantillonnage).
+const Q6: [f64; 3] = [0.5176380902050415, std::f64::consts::FRAC_1_SQRT_2, 1.9318516525781366];
+/// Coupure de ces passe-bas, en part de la cadence d'arrivée.
+const AA1: f64 = 0.40;
+const AA2: f64 = 0.37;
 /// Écart minimal entre deux caisses claires (s), mesuré entre leurs attaques : un roulement de
 /// 20 coups par seconde passe.
 const SNARE_GAP_S: f64 = 0.05;
@@ -80,6 +96,8 @@ const START_FLUX_PK: f64 = 35.0;
 const START_SUB_EXC_PK: f64 = 0.015;
 /// En dessous (dB, toutes bandes), c'est le silence.
 const SILENCE_DB: f64 = -60.0;
+/// Durée de silence (s) après laquelle le contexte est oublié.
+const RESET_S: f64 = 2.0;
 
 #[derive(Clone, Copy)]
 pub struct Biquad {
@@ -95,10 +113,10 @@ pub struct Biquad {
 }
 
 impl Biquad {
-    fn new(sr: f64, f0: f64, high: bool) -> Self {
-        // Formules RBJ, Q = 0,707 (Butterworth).
-        let w = std::f64::consts::TAU * f0 / sr;
-        let (c, a) = (w.cos(), w.sin() / (2.0 * std::f64::consts::FRAC_1_SQRT_2));
+    fn new(sr: f64, f0: f64, high: bool, q: f64) -> Self {
+        // Formules RBJ ; la fréquence reste sous 0,45 × la cadence (filtre stable à toute cadence).
+        let w = std::f64::consts::TAU * f0.min(0.45 * sr) / sr;
+        let (c, a) = (w.cos(), w.sin() / (2.0 * q));
         let a0 = 1.0 + a;
         let (b0, b1, b2) = if high {
             ((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0)
@@ -117,11 +135,16 @@ impl Biquad {
             y2: 0.0,
         }
     }
+    /// Passe-bas et passe-haut du second ordre, Q = 0,707 (Butterworth).
     pub fn lowpass(sr: f64, f0: f64) -> Self {
-        Self::new(sr, f0, false)
+        Self::new(sr, f0, false, std::f64::consts::FRAC_1_SQRT_2)
     }
     pub fn highpass(sr: f64, f0: f64) -> Self {
-        Self::new(sr, f0, true)
+        Self::new(sr, f0, true, std::f64::consts::FRAC_1_SQRT_2)
+    }
+    /// Passe-bas de Butterworth d'ordre 6 (trois biquads en série).
+    fn lowpass6(sr: f64, f0: f64) -> [Self; 3] {
+        Q6.map(|q| Self::new(sr, f0, false, q))
     }
     #[inline]
     pub fn run(&mut self, x: f64) -> f64 {
@@ -164,11 +187,31 @@ impl MeanSquare {
     }
 }
 
-/// Une bande du kick : ses filtres et l'énergie accumulée du pas en cours.
+/// Une bande du kick : ses filtres (les `n` premiers servent) et l'énergie accumulée du pas en cours.
 struct Band {
-    filters: Vec<Biquad>,
+    filters: [Biquad; 4],
+    n: usize,
     acc: f64,
     prev_block: Option<f64>,
+}
+
+impl Band {
+    fn new(sr: f64, hp: Option<f64>, lp: Option<f64>) -> Self {
+        let mut filters = [Biquad::lowpass(sr, 1.0); 4];
+        let mut n = 0;
+        for _ in 0..2 {
+            for f in [hp.map(|f| Biquad::highpass(sr, f)), lp.map(|f| Biquad::lowpass(sr, f))].into_iter().flatten() {
+                filters[n] = f;
+                n += 1;
+            }
+        }
+        Self { filters, n, acc: 0.0, prev_block: None }
+    }
+    #[inline]
+    fn run(&mut self, x: f64) {
+        let y = self.filters[..self.n].iter_mut().fold(x, |v, f| f.run(v));
+        self.acc += y * y;
+    }
 }
 
 /// Mesures d'un pas de 5 ms.
@@ -219,35 +262,96 @@ impl Juge {
     }
 }
 
-/// Petit réseau de décision (`N` entrées → `m::H` tanh → 1), poids dans `kick_modele.rs`.
+/// Petit réseau de décision (`N` mesures de l'attaque + état du contexte → `m::H` tanh → 1),
+/// poids dans `kick_modele.rs`.
 pub(crate) struct Net<const N: usize> {
-    /// Première couche, normalisation des entrées comprise.
+    /// Première couche : part des mesures (normalisation comprise) et part de l'état du contexte.
     pub w: [[f32; N]; m::H],
+    pub u: [[f32; m::G]; m::H],
     pub b: [f32; m::H],
     pub v: [f32; m::H],
     pub c: f32,
-    /// Plage des entrées vue à l'apprentissage : une entrée hors de cette plage (signal
+    /// Plage des mesures vue à l'apprentissage : une mesure hors de cette plage (signal
     /// synthétique, sub muet avant l'attaque…) y est ramenée au lieu d'être extrapolée.
     pub lo: [f32; N],
     pub hi: [f32; N],
 }
 
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
 impl<const N: usize> Net<N> {
-    /// Score du kick en logit (ln p/(1-p)) : positif = plus probable qu'improbable.
-    fn logit(&self, x: &[f64]) -> f64 {
-        let x: Vec<f64> = (0..N).map(|i| x[i].clamp(self.lo[i] as f64, self.hi[i] as f64)).collect();
-        let mut z = self.c as f64;
-        for j in 0..m::H {
-            let h: f64 = self.w[j].iter().zip(&x).map(|(&wi, &xi)| wi as f64 * xi).sum::<f64>() + self.b[j] as f64;
-            z += self.v[j] as f64 * h.tanh();
+    /// Score du coup en logit (ln p/(1-p)) : positif = plus probable qu'improbable.
+    fn logit(&self, x: &[f64], state: &[f32; m::G]) -> f64 {
+        let mut xs = [0f32; N];
+        for (i, v) in xs.iter_mut().enumerate() {
+            *v = (x[i] as f32).clamp(self.lo[i], self.hi[i]);
         }
-        z
+        let mut z = self.c;
+        for j in 0..m::H {
+            z += self.v[j] * (dot(&self.w[j], &xs) + dot(&self.u[j], state) + self.b[j]).tanh();
+        }
+        z as f64
     }
+}
+
+/// Mémoire du contexte : un petit réseau récurrent (GRU) avancé à chaque pas de 5 ms sur les
+/// niveaux des bandes. Son état résume ce qui précède (rythme, coups récents, nature du son) ;
+/// les réseaux de décision le lisent en plus des mesures de l'attaque. Poids dans
+/// `kick_modele.rs`, portes dans l'ordre de PyTorch (r, z, n).
+pub(crate) struct Gru {
+    pub wi: [[f32; m::NI]; 3 * m::G],
+    pub wh: [[f32; m::G]; 3 * m::G],
+    pub bi: [f32; 3 * m::G],
+    pub bh: [f32; 3 * m::G],
+}
+
+impl Gru {
+    fn step(&self, x: &[f32; m::NI], h: &mut [f32; m::G]) {
+        const G: usize = m::G;
+        let (mut gi, mut gh) = (self.bi, self.bh);
+        for (g, row) in gi.iter_mut().zip(&self.wi) {
+            *g += dot(row, x);
+        }
+        for (g, row) in gh.iter_mut().zip(&self.wh) {
+            *g += dot(row, h);
+        }
+        let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+        for j in 0..G {
+            let r = sigmoid(gi[j] + gh[j]);
+            let z = sigmoid(gi[G + j] + gh[G + j]);
+            let n = (gi[2 * G + j] + r * gh[2 * G + j]).tanh();
+            h[j] = (1.0 - z) * n + z * h[j];
+        }
+    }
+}
+
+/// Entrées du GRU pour un pas (dans l'ordre de `scripts/kick_modele.py`, `frame_inputs`) : niveau
+/// de chaque bande fine par rapport au plus fort pic du morceau, montée de chaque bande sur
+/// 10 ms (`old` : niveaux deux pas plus tôt), excès du sub, rapport sub / médiums.
+fn context_inputs(f: &Frame, old: Option<&[f64; NF]>) -> [f32; m::NI] {
+    let loud = f.peak.iter().fold(f64::MIN, |a, &v| a.max(v));
+    let mut x = [0f32; m::NI];
+    for b in 0..NF {
+        x[b] = ((f.lf[b] - loud) / 20.0).clamp(-4.0, 0.5) as f32;
+        x[NF + b] = old.map_or(0.0, |o| ((f.lf[b] - o[b]).max(0.0) / 10.0).min(4.0)) as f32;
+    }
+    x[2 * NF] = f.sub_onset.min(1.0) as f32;
+    x[2 * NF + 1] = (f.sub_vs_mid / 20.0).clamp(-3.0, 3.0) as f32;
+    x
 }
 
 pub struct Analyzer {
     low: [Biquad; 3],
     low_e: MeanSquare,
+    /// Passe-bas avant chaque sous-échantillonnage, facteur du premier (le second vaut 2) et
+    /// compteurs d'échantillons.
+    aa1: [Biquad; 3],
+    aa2: [Biquad; 3],
+    d1: usize,
+    c1: usize,
+    c2: bool,
     hop: usize,
     hop_count: usize,
     dt: f64,
@@ -264,6 +368,9 @@ pub struct Analyzer {
     sub_exc_pk: f64,
     kick: Juge,
     snare: Juge,
+    /// État du contexte (GRU), et nombre de pas de silence de suite.
+    state: [f32; m::G],
+    silent_hops: u32,
     /// Délai minimal entre deux kicks (s), mesuré entre leurs attaques.
     pub min_gap_s: f64,
     last_kick: f64,
@@ -290,22 +397,20 @@ pub struct Analyzer {
 impl Analyzer {
     pub fn new(sample_rate: u32) -> Self {
         let sr = sample_rate as f64;
-        let dec = (sr / PITCH_RATE).round().max(1.0) as usize;
-        let hop = (sr * HOP_S).round().max(1.0) as usize;
-        let bands = BANDS
-            .iter()
-            .map(|&(hp, lp)| {
-                let mut filters = Vec::new();
-                for _ in 0..2 {
-                    filters.extend(hp.map(|f| Biquad::highpass(sr, f)));
-                    filters.extend(lp.map(|f| Biquad::lowpass(sr, f)));
-                }
-                Band { filters, acc: 0.0, prev_block: None }
-            })
-            .collect();
+        // cadences : origine, ~12 kHz (÷ d1), ~6 kHz (÷ 2 d1) ; le pas est un multiple de 2 d1
+        let d1 = (sr / 12000.0).round().max(1.0) as usize;
+        let rates = [sr, sr / d1 as f64, sr / (2 * d1) as f64];
+        let hop = 2 * d1 * ((sr * HOP_S / (2 * d1) as f64).round().max(1.0) as usize);
+        let dec = (rates[2] / PITCH_RATE).round().max(1.0) as usize;
+        let bands = BANDS.iter().zip(BAND_STAGE).map(|(&(hp, lp), stage)| Band::new(rates[stage], hp, lp)).collect();
         Self {
-            low: [Biquad::lowpass(sr, 90.0); 3],
-            low_e: MeanSquare::new((sr * BASS_WIN_S).round() as usize),
+            low: [Biquad::lowpass(rates[2], 90.0); 3],
+            low_e: MeanSquare::new((rates[2] * BASS_WIN_S).round() as usize),
+            aa1: Biquad::lowpass6(sr, AA1 * rates[1]),
+            aa2: Biquad::lowpass6(rates[1], AA2 * rates[2]),
+            d1,
+            c1: 0,
+            c2: false,
             hop,
             hop_count: 0,
             dt: hop as f64 / sr,
@@ -320,6 +425,8 @@ impl Analyzer {
             sub_exc_pk: START_SUB_EXC_PK,
             kick: Juge::new(Coup::Kick),
             snare: Juge::new(Coup::Caisse),
+            state: [0.0; m::G],
+            silent_hops: 0,
             min_gap_s: 0.1,
             last_kick: -9.0,
             sensitivity: 5.0,
@@ -330,7 +437,7 @@ impl Analyzer {
             bass: 0.0,
             dec,
             dec_count: 0,
-            dec_rate: sr / dec as f64,
+            dec_rate: rates[2] / dec as f64,
             pitch_buf: VecDeque::with_capacity(PITCH_N + LAG_MAX + 2),
             pitch: 0.0,
         }
@@ -352,19 +459,14 @@ impl Analyzer {
 
     #[inline]
     fn sample(&mut self, x: f64) {
-        let l = self.low.iter_mut().fold(x, |v, f| f.run(v));
-        self.low_e.push(l);
-        for b in &mut self.bands {
-            let y = b.filters.iter_mut().fold(x, |v, f| f.run(v));
-            b.acc += y * y;
+        for (b, _) in self.bands.iter_mut().zip(BAND_STAGE).filter(|&(_, s)| s == 0) {
+            b.run(x);
         }
-        self.dec_count += 1;
-        if self.dec_count >= self.dec {
-            self.dec_count = 0;
-            if self.pitch_buf.len() == PITCH_N + LAG_MAX + 1 {
-                self.pitch_buf.pop_front();
-            }
-            self.pitch_buf.push_back(l);
+        let y = self.aa1.iter_mut().fold(x, |v, f| f.run(v));
+        self.c1 += 1;
+        if self.c1 >= self.d1 {
+            self.c1 = 0;
+            self.sample_mid(y);
         }
         self.hop_count += 1;
         if self.hop_count >= self.hop {
@@ -373,6 +475,44 @@ impl Analyzer {
             self.kick_step();
             self.bass_step();
         }
+    }
+
+    /// Un échantillon à ~12 kHz : bandes de 1 à 4 kHz, puis un sur deux vers le grave.
+    #[inline]
+    fn sample_mid(&mut self, x: f64) {
+        for (b, _) in self.bands.iter_mut().zip(BAND_STAGE).filter(|&(_, s)| s == 1) {
+            b.run(x);
+        }
+        let y = self.aa2.iter_mut().fold(x, |v, f| f.run(v));
+        self.c2 = !self.c2;
+        if !self.c2 {
+            self.sample_low(y);
+        }
+    }
+
+    /// Un échantillon à ~6 kHz : bandes sous 1 kHz, niveau du grave, tampon de la hauteur.
+    #[inline]
+    fn sample_low(&mut self, x: f64) {
+        for (b, _) in self.bands.iter_mut().zip(BAND_STAGE).filter(|&(_, s)| s == 2) {
+            b.run(x);
+        }
+        let l = self.low.iter_mut().fold(x, |v, f| f.run(v));
+        self.low_e.push(l);
+        self.dec_count += 1;
+        if self.dec_count >= self.dec {
+            self.dec_count = 0;
+            if self.pitch_buf.len() == PITCH_N + LAG_MAX + 1 {
+                self.pitch_buf.pop_front();
+            }
+            self.pitch_buf.push_back(l);
+        }
+    }
+
+    /// Nombre de pas calculés et niveaux (dB) des bandes fines au dernier pas : pour comparer les
+    /// mesures avec celles de `scripts/kick_modele.py` (exemple `kick_mesures`).
+    #[doc(hidden)]
+    pub fn niveaux(&self) -> (u64, [f64; NF]) {
+        (self.hops, self.frames.back().map_or([0.0; NF], |f| f.lf))
     }
 
     /// Mesures du pas `i` (indice absolu), encore en mémoire.
@@ -385,8 +525,9 @@ impl Analyzer {
         let dt = self.dt;
         let i = self.hops;
         let mut f = Frame::default();
+        let per_stage = [self.hop, self.hop / self.d1, self.hop / (2 * self.d1)];
         for (b, band) in self.bands.iter_mut().enumerate() {
-            let block = band.acc / self.hop as f64;
+            let block = band.acc / per_stage[BAND_STAGE[b]] as f64;
             band.acc = 0.0;
             let e = band.prev_block.map_or(block, |p| (block + p) / 2.0); // fenêtre 10 ms
             band.prev_block = Some(block);
@@ -420,6 +561,16 @@ impl Analyzer {
         self.mids.push_back(lin[1] + lin[2]);
         let mid_max = self.mids.iter().fold(0.0f64, |a, &v| a.max(v));
         f.sub_vs_mid = 10.0 * (lin[0] / (mid_max + 1e-12) + 1e-9).log10();
+        // contexte : le GRU avance d'un pas ; après `RESET_S` de silence, il repart de zéro
+        // (comme au début de chaque morceau d'apprentissage)
+        self.silent_hops = if decay { 0 } else { self.silent_hops + 1 };
+        if self.silent_hops as f64 * dt >= RESET_S {
+            self.state = [0.0; m::G];
+        } else {
+            let old = if i >= 2 { Some(self.frame(i - 2).lf) } else { None };
+            let x = context_inputs(&f, old.as_ref());
+            m::GRU.step(&x, &mut self.state);
+        }
         if self.frames.len() == HIST {
             self.frames.pop_front();
         }
@@ -485,14 +636,14 @@ impl Analyzer {
 
     /// Score (logit) de l'attaque du pas `p` jugée `s` pas après.
     fn score(&self, coup: Coup, p: u64, s: usize) -> f64 {
-        let x = self.features(p, s);
+        let (x, h) = (self.features(p, s), &self.state);
         match (coup, s) {
-            (Coup::Kick, 2) => m::KICK2.logit(&x),
-            (Coup::Kick, 4) => m::KICK4.logit(&x),
-            (Coup::Kick, _) => m::KICK6.logit(&x),
-            (Coup::Caisse, 2) => m::CAISSE2.logit(&x),
-            (Coup::Caisse, 4) => m::CAISSE4.logit(&x),
-            (Coup::Caisse, _) => m::CAISSE6.logit(&x),
+            (Coup::Kick, 2) => m::KICK2.logit(&x, h),
+            (Coup::Kick, 4) => m::KICK4.logit(&x, h),
+            (Coup::Kick, _) => m::KICK6.logit(&x, h),
+            (Coup::Caisse, 2) => m::CAISSE2.logit(&x, h),
+            (Coup::Caisse, 4) => m::CAISSE4.logit(&x, h),
+            (Coup::Caisse, _) => m::CAISSE6.logit(&x, h),
         }
     }
 

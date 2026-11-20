@@ -1,18 +1,22 @@
 """Prépare les données du banc d'essai du kick (`examples/kick_bench.rs`).
 
 Pour chaque morceau : `<nom>.f32` (mélange complet, mono, f32, 48 kHz), `<nom>.kicks` et
-`<nom>.caisses` (instants des vrais kicks et des vraies caisses claires, en secondes).
+`<nom>.caisses` (instants des vrais kicks et des vraies caisses claires, en secondes) et, avec
+`--demucs`, `<nom>.kicks_doute` et `<nom>.caisses_doute` (instants où la référence est incertaine).
 
     python kick_bench.py mdb <dossier MDB Drums> <sortie>        annotations humaines de MDB Drums
     python kick_bench.py ref <sortie> <fichier ou dossier>...    n'importe quel morceau (référence ADTOF)
-    python kick_bench.py caisses <sortie> [--demucs]             `.caisses` des morceaux déjà préparés (ADTOF)
     python kick_bench.py valide <dossier MDB Drums> [--demucs]   ADTOF comparé aux annotations de MDB
 
 La référence d'un morceau quelconque vient d'ADTOF (transcription de batterie par réseau de neurones,
 entraîné sur des centaines d'heures de vraie musique ; F1 ≈ 0,88 sur MDB Drums), hors temps réel et
 avec tout le morceau sous les yeux. Avec `--demucs`, ADTOF écoute la batterie séparée par Demucs
-(htdemucs) au lieu du mélange. Ce n'est pas la vérité, mais une bien meilleure approximation que tout
-détecteur causal : `valide` mesure son accord avec les annotations humaines.
+(htdemucs) et, à part, le mélange : un coup vu par les deux est sûr (`.kicks`, précision 0,92 face aux
+annotations de MDB), un coup vu par une seule des deux écoutes est douteux (`.kicks_doute` : ni kick
+ni non-kick pour l'apprentissage et l'évaluation). Ce n'est pas la vérité, mais une bien meilleure
+approximation que tout détecteur causal : `valide` mesure son accord avec les annotations humaines.
+`--pistes <dossier>` (avec `--demucs`) garde les 4 pistes séparées (`<nom>.npy`, int16, 44,1 kHz :
+drums, bass, other, vocals) pour `kick_remix.py`.
 
 Dépendances (environnement à part) : ffmpeg dans le PATH ; numpy, scipy, torch, adtof-pytorch,
 demucs (seulement pour `--demucs`).
@@ -94,8 +98,8 @@ def adtof_notes(mono, sr):
 _demucs = None
 
 
-def separate_drums(stereo48):
-    """Piste de batterie (mono, 44,1 kHz) séparée par htdemucs."""
+def separate(stereo48):
+    """Les 4 pistes (drums, bass, other, vocals ; mono, 44,1 kHz) séparées par htdemucs."""
     global _demucs
     import torch
     from demucs.apply import apply_model
@@ -111,14 +115,33 @@ def separate_drums(stereo48):
     with torch.no_grad():
         src = apply_model(_demucs, ((wav - mean) / std)[None], device=dev, split=True, overlap=0.25, progress=False)[0]
     src = src * std + mean
-    return src[_demucs.sources.index("drums")].mean(0).cpu().numpy(), sr
+    order = [_demucs.sources.index(n) for n in ("drums", "bass", "other", "vocals")]
+    return src[order].mean(1).cpu().numpy(), sr
 
 
-def reference(stereo, use_demucs):
-    if use_demucs:
-        drums, sr = separate_drums(stereo)
-        return adtof_notes(drums, sr)
-    return adtof_notes(stereo.mean(axis=0), SR)
+def consensus(a, b, tol=TOL):
+    """(coups de `a` retrouvés dans `b` à ±tol, coups vus par une seule des deux listes)."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    used, ok = np.zeros(len(b), bool), np.zeros(len(a), bool)
+    for i, t in enumerate(a):
+        c = np.where(~used & (np.abs(b - t) <= tol))[0]
+        if len(c):
+            used[c[np.argmin(np.abs(b[c] - t))]] = True
+            ok[i] = True
+    return a[ok], np.sort(np.concatenate([a[~ok], b[~used]]))
+
+
+def reference(stereo, use_demucs, stems_out=None):
+    """({note: instants sûrs}, {note: instants douteux}) ; sans Demucs, tout est sûr."""
+    mix = adtof_notes(stereo.mean(axis=0), SR)
+    if not use_demucs:
+        return mix, {}
+    stems, sr = separate(stereo)
+    if stems_out is not None:
+        np.save(stems_out, (np.clip(stems, -1, 1) * 32767).astype(np.int16))
+    drums = adtof_notes(stems[0], sr)
+    both = {n: consensus(drums.get(n, []), mix.get(n, [])) for n in set(drums) | set(mix)}
+    return {n: v[0] for n, v in both.items()}, {n: v[1] for n, v in both.items()}
 
 
 def mdb_tracks(root):
@@ -139,6 +162,12 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     args = [a for a in sys.argv[1:] if a != "--demucs"]
     use_demucs = "--demucs" in sys.argv
+    stems_dir = None
+    if "--pistes" in args:
+        i = args.index("--pistes")
+        stems_dir = pathlib.Path(args[i + 1])
+        stems_dir.mkdir(parents=True, exist_ok=True)
+        del args[i : i + 2]
     if not args:
         sys.exit(__doc__)
     mode = args[0]
@@ -153,7 +182,7 @@ def main():
     elif mode == "valide":
         tot = [0, 0, 0]
         for name, mix, ref, _ in mdb_tracks(pathlib.Path(args[1])):
-            got = reference(load(mix), use_demucs).get(35, [])
+            got = reference(load(mix), use_demucs)[0].get(35, [])
             used, tp = set(), 0
             for g in got:
                 m = [i for i, r in enumerate(ref) if i not in used and abs(g - r) <= TOL]
@@ -177,22 +206,16 @@ def main():
                 continue
             try:
                 stereo = load(f)
-                notes = reference(stereo, use_demucs)
+                notes, doubt = reference(stereo, use_demucs, stems_dir / f"{name}.npy" if stems_dir else None)
             except Exception as e:  # fichier illisible : on passe au suivant
                 print(f"{name} : ÉCHEC {e}", flush=True)
                 continue
             stereo.mean(axis=0).astype("<f4").tofile(out / f"{name}.f32")
-            save_kicks(notes.get(35, []), out / f"{name}.kicks")
-            save_kicks(notes.get(38, []), out / f"{name}.caisses")
-            print(f"{name} : {len(notes.get(35, []))} kicks, {len(notes.get(38, []))} caisses claires", flush=True)
-    elif mode == "caisses":
-        for f in sorted(pathlib.Path(args[1]).glob("*.f32")):
-            if f.with_suffix(".caisses").exists():
-                continue
-            mono = np.fromfile(f, dtype="<f4")
-            snares = reference(np.stack([mono, mono]), use_demucs).get(38, [])
-            save_kicks(snares, f.with_suffix(".caisses"))
-            print(f"{f.stem} : {len(snares)} caisses claires", flush=True)
+            for note, suffix in ((35, ".kicks"), (38, ".caisses")):
+                save_kicks(notes.get(note, []), out / f"{name}{suffix}")
+                if use_demucs:
+                    save_kicks(doubt.get(note, []), out / f"{name}{suffix}_doute")
+            print(f"{name} : {len(notes.get(35, []))} kicks, {len(notes.get(38, []))} caisses claires ; douteux : {len(doubt.get(35, []))}, {len(doubt.get(38, []))}", flush=True)
     else:
         sys.exit(__doc__)
 
