@@ -61,8 +61,8 @@ FPK0 = 35.0
 SUBPK0 = 0.015
 SILENCE_DB = -60.0
 H = 32  # couche cachée des réseaux de décision
-G = 32  # taille du GRU
-EPOCHS, STEPS, BATCH, SEG = 40, 24, 48, 3000  # apprentissage : 40 × 24 lots de 48 extraits de 15 s
+G = 48  # taille du GRU
+EPOCHS, STEPS, BATCH, SEG = 400, 24, 48, 3000  # apprentissage : 400 × 24 lots de 48 extraits de 15 s (au-delà, plus de gain)
 LIGHT = 0.25
 THRESHOLDS = [0.8, 0.7, 0.5]  # à sensibilité 5 (= STAGE_LOGIT en Rust) ; les mêmes pour la caisse claire
 GAP = 0.1  # kick ; caisse claire : SNARE_GAP
