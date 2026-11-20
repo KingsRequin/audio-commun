@@ -145,3 +145,35 @@ roulements de montée sans kick. Pour la caisse claire, la boîte à rythmes ne 
 boîte à rythmes toute simple n'était plus reconnue. Les mesures de `kick_modele.py` (`levels`, `macro`,
 `prep`, `features`) sont reproduites à l'identique dans `kick.rs` : les changer des deux côtés, puis
 réapprendre. Environnement utilisé : Python 3.11, torch 2.6 (CUDA), demucs, adtof-pytorch, scipy ; ffmpeg.
+
+### Pistes suivantes (non faites, notées le 2026-11-20)
+
+Par ordre de gain attendu. Chacune se juge comme les précédentes : `kick_modele.py valider` (validation
+croisée, F1 kick et caisse claire, perso et MDB), puis tests synthétiques et `kick_bench`, chiffres ici.
+
+1. **Moins de faux kicks sur la basse et les voix.** Faire garder par Demucs les pistes `bass` et `vocals`
+   (aujourd'hui seule `drums` sert, puis est jetée) et en tirer des exemples négatifs : attaques candidates
+   où la basse ou la voix montent sans kick dans la référence, ou remixages « morceau sans batterie »
+   (bass + vocals + other) dont toutes les attaques sont des non-kicks. À peser comme les données d'appoint
+   (`--leger`). Cible : précision du kick, et les faux kicks d'intro (75 sur 107 morceaux).
+2. **Astuces d'entraînement de Weber et al. (2024)** : élargir la cible (les candidats voisins d'un vrai
+   coup comptent comme positifs à poids réduit), pondérer les classes (kick, caisse claire, rien), et
+   compléter les données par changements de hauteur et de tempo. Rien à changer côté Rust si les mesures
+   restent les mêmes.
+3. **Notes fantômes et batterie acoustique** : sur MDB, 34 % seulement des caisses claires sont trouvées
+   (rappel), surtout les coups légers du jazz. Piste : un seuil de caisse claire relatif au niveau des
+   caisses récentes, ou un attribut « niveau de l'attaque par rapport aux 2 s d'avant ».
+4. **Démarrage** : à 90 BPM, le test d'Essaim `tempo_trouve_sur_des_kicks_reguliers` montre que les 2
+   premiers kicks d'un flux sont manqués (l'ancien modèle les trouvait), à cause de la règle « sans kick
+   depuis 4 s, le premier doit être franc ». Mesurer avec `kick_bench` ce que coûterait un relèvement plus
+   court ou plus doux.
+5. **Tempo (`pulsation`)** sur l'activité continue de la batterie (sortie des réseaux à chaque attaque, ou
+   flux spectral) plutôt que sur les seuls instants des kicks, à la manière de BeatNet+ (Heydari 2024,
+   filtre particulaire en ligne) : plus robuste quand le kick manque (breaks, rap sans kick régulier).
+6. **Essai en vrai** non lancé pour la 0.3.0 : `cargo test --release -- --ignored musique_reelle` dans
+   Essaim, un morceau en lecture.
+
+Pour reprendre : les données sont prêtes (`.f32`, `.kicks`, `.caisses` des 107 morceaux, MDB et ses
+remixages, boîte à rythmes) ; seules les pistes séparées par Demucs ont été effacées (piste 1 : relancer
+`kick_bench.py ref --demucs` en les gardant). Lectures : Böck et Widmer 2013 (détection d'attaques en ligne),
+Vogl et al. 2017 (transcription de batterie), Weber et al. 2024, Heydari et al. 2024 (BeatNet+), ADTOF.
