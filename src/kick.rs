@@ -1,19 +1,25 @@
-//! Analyse du son : kick (grosse caisse), niveau de basse et hauteur de la note de basse.
+//! Analyse du son : kick (grosse caisse), caisse claire, niveau de basse et hauteur de la note
+//! de basse.
 //!
 //! Méthode (voir README, section « Kick ») :
-//! - kick : le son est découpé en 5 bandes (sub sous 90 Hz, 90–200 Hz, 200 Hz–1 kHz, 1–4 kHz,
-//!   au-delà ; biquads, pas de FFT) dont on suit le niveau en dB tous les 5 ms. Une attaque
-//!   candidate est un pic de la montée d'énergie toutes bandes confondues (connu 5 ms après
-//!   l'attaque). Elle est ensuite jugée par un petit réseau de neurones (une couche cachée de 16)
-//!   sur la forme de l'attaque : montée de chaque bande, niveau par rapport au morceau, équilibre
-//!   du spectre, excès du sub sur sa moyenne lente. Trois réseaux décident 10, 20 et 30 ms après
-//!   l'attaque : un kick franc part tout de suite, un cas douteux attend d'en entendre plus.
+//! - kick : le son est découpé en 10 bandes (sous 50 Hz, 50–90, 90–140, 140–200, 200–450,
+//!   450 Hz–1 kHz, 1–2 kHz, 2–4 kHz, 4–8 kHz, au-delà ; biquads, pas de FFT) dont on suit le
+//!   niveau en dB tous les 5 ms ; deux bandes voisines forment une des 5 bandes larges (sub,
+//!   90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus). Une attaque candidate est un pic de la montée
+//!   d'énergie des bandes larges (connu 5 ms après l'attaque). Elle est ensuite jugée par un
+//!   petit réseau de neurones (une couche cachée de 32) sur la forme de l'attaque : montée de
+//!   chaque bande, niveau par rapport au morceau, équilibre du spectre, excès du sub sur sa
+//!   moyenne lente. Trois réseaux décident 10, 20 et 30 ms après l'attaque : un kick franc part
+//!   tout de suite, un cas douteux attend d'en entendre plus.
 //!   Sans kick depuis 4 s (intro, montée, après une pause), le premier doit être franc.
 //!   Les poids (`kick_modele.rs`) sont appris par `scripts/kick_modele.py` sur des morceaux réels
 //!   annotés (MDB Drums, et des morceaux dont la batterie est transcrite par ADTOF).
 //!   Pourquoi pas seulement le sub : en musique électronique, l'attaque du kick est dans les
 //!   médiums et les aigus et le sub n'arrive que 50 à 100 ms plus tard (il commence même par se
 //!   creuser, à cause du sidechain) ; un détecteur de sub y est en retard et confond la basse.
+//! - caisse claire (et claps) : mêmes candidats, mêmes mesures, trois réseaux à elle, mêmes
+//!   seuils qu'un kick à sensibilité 5 ; une attaque peut être à la fois un kick et une caisse
+//!   claire (frappés ensemble). Appris sur les mêmes morceaux (MDB Drums, ADTOF).
 //! - basse : niveau du grave en dB, rapporté au pic récent du morceau (plage fixe de 20 dB).
 //! - hauteur : autocorrélation du grave sous-échantillonné à ~1 kHz, entre 25 et 83 Hz.
 //!
@@ -30,14 +36,25 @@ const PITCH_N: usize = 48; // fenêtre d'autocorrélation : 48 ms
 const LAG_MIN: usize = 12; // 83 Hz
 const LAG_MAX: usize = 40; // 25 Hz
 
-/// Bandes du kick : (passe-haut, passe-bas) en Hz, chacun d'ordre 4 (deux biquads).
-const BANDS: [(Option<f64>, Option<f64>); 5] = [
-    (None, Some(90.0)),
-    (Some(90.0), Some(200.0)),
-    (Some(200.0), Some(1000.0)),
-    (Some(1000.0), Some(4000.0)),
-    (Some(4000.0), None),
+/// Bandes fines : (passe-haut, passe-bas) en Hz, chacun d'ordre 4 (deux biquads). Les bandes
+/// `2b` et `2b + 1` forment la bande large `b`.
+const BANDS: [(Option<f64>, Option<f64>); NF] = [
+    (None, Some(50.0)),
+    (Some(50.0), Some(90.0)),
+    (Some(90.0), Some(140.0)),
+    (Some(140.0), Some(200.0)),
+    (Some(200.0), Some(450.0)),
+    (Some(450.0), Some(1000.0)),
+    (Some(1000.0), Some(2000.0)),
+    (Some(2000.0), Some(4000.0)),
+    (Some(4000.0), Some(8000.0)),
+    (Some(8000.0), None),
 ];
+/// Nombre de bandes fines.
+const NF: usize = 10;
+/// Écart minimal entre deux caisses claires (s), mesuré entre leurs attaques : un roulement de
+/// 20 coups par seconde passe.
+const SNARE_GAP_S: f64 = 0.05;
 /// Pas (5 ms) entre l'attaque et chaque décision.
 const STAGES: [usize; 3] = [2, 4, 6];
 /// Seuils de chaque décision à sensibilité 5, en logit (ln p/(1-p)) : probabilité 0,8, 0,7 et
@@ -157,7 +174,9 @@ struct Band {
 /// Mesures d'un pas de 5 ms.
 #[derive(Clone, Copy, Default)]
 struct Frame {
-    /// Niveau de chaque bande (dB, fenêtre 10 ms).
+    /// Niveau de chaque bande fine (dB, fenêtre 10 ms).
+    lf: [f64; NF],
+    /// Niveau de chaque bande large (dB) : somme des puissances de ses deux bandes fines.
     l: [f64; 5],
     /// Montée d'énergie toutes bandes (somme des montées en dB sur 10 ms).
     flux: f64,
@@ -179,12 +198,33 @@ struct Pending {
     stage: usize,
 }
 
-/// Petit réseau de décision (`N` entrées → 16 tanh → 1), poids dans `kick_modele.rs`.
+/// Ce que reconnaît un détecteur.
+#[derive(Clone, Copy, PartialEq)]
+enum Coup {
+    Kick,
+    Caisse,
+}
+
+/// Un détecteur (kick ou caisse claire) : ses candidats en attente de décision.
+struct Juge {
+    coup: Coup,
+    pending: Vec<Pending>,
+    /// Instant de l'attaque du dernier coup reconnu.
+    last_attack: f64,
+}
+
+impl Juge {
+    fn new(coup: Coup) -> Self {
+        Self { coup, pending: Vec::new(), last_attack: -9.0 }
+    }
+}
+
+/// Petit réseau de décision (`N` entrées → `m::H` tanh → 1), poids dans `kick_modele.rs`.
 pub(crate) struct Net<const N: usize> {
     /// Première couche, normalisation des entrées comprise.
-    pub w: [[f32; N]; 16],
-    pub b: [f32; 16],
-    pub v: [f32; 16],
+    pub w: [[f32; N]; m::H],
+    pub b: [f32; m::H],
+    pub v: [f32; m::H],
     pub c: f32,
     /// Plage des entrées vue à l'apprentissage : une entrée hors de cette plage (signal
     /// synthétique, sub muet avant l'attaque…) y est ramenée au lieu d'être extrapolée.
@@ -197,7 +237,7 @@ impl<const N: usize> Net<N> {
     fn logit(&self, x: &[f64]) -> f64 {
         let x: Vec<f64> = (0..N).map(|i| x[i].clamp(self.lo[i] as f64, self.hi[i] as f64)).collect();
         let mut z = self.c as f64;
-        for j in 0..16 {
+        for j in 0..m::H {
             let h: f64 = self.w[j].iter().zip(&x).map(|(&wi, &xi)| wi as f64 * xi).sum::<f64>() + self.b[j] as f64;
             z += self.v[j] as f64 * h.tanh();
         }
@@ -222,9 +262,8 @@ pub struct Analyzer {
     peak: [f64; 5],
     sub_slow: f64,
     sub_exc_pk: f64,
-    pending: Vec<Pending>,
-    /// Instant de l'attaque du dernier kick.
-    last_attack: f64,
+    kick: Juge,
+    snare: Juge,
     /// Délai minimal entre deux kicks (s), mesuré entre leurs attaques.
     pub min_gap_s: f64,
     last_kick: f64,
@@ -232,6 +271,8 @@ pub struct Analyzer {
     pub sensitivity: f32,
     /// Nombre total de kicks détectés.
     pub kicks: u32,
+    /// Nombre total de caisses claires (et claps) détectées.
+    pub caisses: u32,
     // basse
     peak_db: f64,
     bass_target: f64,
@@ -277,12 +318,13 @@ impl Analyzer {
             peak: START_PEAK,
             sub_slow: 0.0,
             sub_exc_pk: START_SUB_EXC_PK,
-            pending: Vec::new(),
-            last_attack: -9.0,
+            kick: Juge::new(Coup::Kick),
+            snare: Juge::new(Coup::Caisse),
             min_gap_s: 0.1,
             last_kick: -9.0,
             sensitivity: 5.0,
             kicks: 0,
+            caisses: 0,
             peak_db: -60.0,
             bass_target: 0.0,
             bass: 0.0,
@@ -348,8 +390,10 @@ impl Analyzer {
             band.acc = 0.0;
             let e = band.prev_block.map_or(block, |p| (block + p) / 2.0); // fenêtre 10 ms
             band.prev_block = Some(block);
-            f.l[b] = 10.0 * (e + 1e-12).log10();
+            f.lf[b] = 10.0 * (e + 1e-12).log10();
         }
+        let fine = f.lf.map(|v| 10f64.powf(v / 10.0));
+        f.l = std::array::from_fn(|b| 10.0 * (fine[2 * b] + fine[2 * b + 1]).log10());
         if i >= 2 {
             let old = self.frame(i - 2).l;
             f.flux = (0..5).map(|b| (f.l[b] - old[b]).max(0.0)).sum();
@@ -387,51 +431,68 @@ impl Analyzer {
             let p = i - 1;
             let (a, prev) = (self.frame(p), self.frame(p - 1));
             if a.flux > prev.flux && a.flux >= f.flux && a.flux >= 0.15 * prev.flux_pk && a.tot > -70.0 {
-                self.pending.push(Pending { hop: p, stage: 0 });
+                self.kick.pending.push(Pending { hop: p, stage: 0 });
+                self.snare.pending.push(Pending { hop: p, stage: 0 });
             }
         }
-        self.decide(i);
+        let mut juge = std::mem::replace(&mut self.kick, Juge::new(Coup::Kick));
+        let kicks = self.decide(&mut juge, i);
+        self.kick = juge;
+        if kicks > 0 {
+            self.kicks = self.kicks.wrapping_add(kicks);
+            self.last_kick = self.t;
+        }
+        let mut juge = std::mem::replace(&mut self.snare, Juge::new(Coup::Caisse));
+        self.caisses = self.caisses.wrapping_add(self.decide(&mut juge, i));
+        self.snare = juge;
     }
 
-    /// Juge les candidats dont une étape de décision tombe sur le pas `i`.
-    fn decide(&mut self, i: u64) {
-        let shift = (5.0 - self.sensitivity.clamp(1.0, 10.0) as f64) * SENS_STEP;
+    /// Juge les candidats de `juge` dont une étape de décision tombe sur le pas `i` ; renvoie le
+    /// nombre de coups reconnus.
+    fn decide(&self, juge: &mut Juge, i: u64) -> u32 {
+        let kick = juge.coup == Coup::Kick;
+        // La sensibilité règle le dernier seuil du kick (combien de kicks) ; les décisions
+        // précoces gardent le leur (à quel point il faut être sûr pour ne pas attendre), jamais
+        // plus bas. La caisse claire garde les seuils d'un kick à sensibilité 5.
+        let shift = if kick { (5.0 - self.sensitivity.clamp(1.0, 10.0) as f64) * SENS_STEP } else { 0.0 };
+        let gap = if kick { self.min_gap_s.max(0.05) } else { SNARE_GAP_S };
+        let mut found = 0;
         let mut k = 0;
-        while k < self.pending.len() {
-            let Pending { hop: p, stage } = self.pending[k];
+        while k < juge.pending.len() {
+            let Pending { hop: p, stage } = juge.pending[k];
             if p + STAGES[stage] as u64 != i {
                 k += 1;
                 continue;
             }
             let attack = p as f64 * self.dt;
-            let since = attack - self.last_attack;
-            let quiet = if since > QUIET_S { QUIET_RAISE } else { 0.0 };
-            // La sensibilité règle le dernier seuil (combien de kicks) ; les décisions précoces
-            // gardent le leur (à quel point il faut être sûr pour ne pas attendre), jamais plus bas.
+            let since = attack - juge.last_attack;
+            let quiet = if kick && since > QUIET_S { QUIET_RAISE } else { 0.0 };
             let last = STAGE_LOGIT[STAGES.len() - 1] + shift;
             let thr = if stage + 1 == STAGES.len() { last } else { STAGE_LOGIT[stage].max(last) } + quiet;
-            let fires = since > self.min_gap_s.max(0.05) && self.score(p, STAGES[stage]) > thr;
-            if fires {
-                self.kicks = self.kicks.wrapping_add(1);
-                self.last_kick = self.t;
-                self.last_attack = attack;
-                self.pending.swap_remove(k);
+            if since > gap && self.score(juge.coup, p, STAGES[stage]) > thr {
+                found += 1;
+                juge.last_attack = attack;
+                juge.pending.swap_remove(k);
             } else if stage + 1 < STAGES.len() {
-                self.pending[k].stage += 1;
+                juge.pending[k].stage += 1;
                 k += 1;
             } else {
-                self.pending.swap_remove(k);
+                juge.pending.swap_remove(k);
             }
         }
+        found
     }
 
     /// Score (logit) de l'attaque du pas `p` jugée `s` pas après.
-    fn score(&self, p: u64, s: usize) -> f64 {
+    fn score(&self, coup: Coup, p: u64, s: usize) -> f64 {
         let x = self.features(p, s);
-        match s {
-            2 => m::NET2.logit(&x),
-            4 => m::NET4.logit(&x),
-            _ => m::NET6.logit(&x),
+        match (coup, s) {
+            (Coup::Kick, 2) => m::KICK2.logit(&x),
+            (Coup::Kick, 4) => m::KICK4.logit(&x),
+            (Coup::Kick, _) => m::KICK6.logit(&x),
+            (Coup::Caisse, 2) => m::CAISSE2.logit(&x),
+            (Coup::Caisse, 4) => m::CAISSE4.logit(&x),
+            (Coup::Caisse, _) => m::CAISSE6.logit(&x),
         }
     }
 
@@ -442,6 +503,12 @@ impl Analyzer {
         let mut pre = [f64::MAX; 5];
         for q in p - PRE..p - 1 {
             for (v, l) in pre.iter_mut().zip(self.frame(q).l) {
+                *v = v.min(l);
+            }
+        }
+        let mut pref = [f64::MAX; NF];
+        for q in p - PRE..p - 1 {
+            for (v, l) in pref.iter_mut().zip(self.frame(q).lf) {
                 *v = v.min(l);
             }
         }
@@ -458,6 +525,12 @@ impl Analyzer {
         }
         (0..5).for_each(|b| put(now.l[b] - before.peak[b])); // niveau par rapport au morceau
         (0..5).for_each(|b| put(now.l[b] - now.tot)); // équilibre du spectre
+        // la même chose en bandes fines : montée, puis spectre
+        for j in [1u64, 2, 4, 6].into_iter().filter(|&j| j <= s as u64) {
+            let l = self.frame(p + j).lf;
+            (0..NF).for_each(|b| put(l[b] - pref[b]));
+        }
+        (0..NF).for_each(|b| put(now.lf[b] - now.tot));
         let loudest = before.peak.iter().fold(f64::MIN, |a, &v| a.max(v));
         put((self.frame(p).flux / before.flux_pk + 1e-3).ln());
         put(now.tot - loudest);
@@ -612,17 +685,44 @@ mod tests {
 
     /// Instants (s) où le compteur de kicks augmente.
     fn kick_times(sig: &[f32], sens: f32) -> Vec<f64> {
+        times(sig, sens, |a| a.kicks)
+    }
+
+    /// Instants (s) où le compteur `count` augmente.
+    fn times(sig: &[f32], sens: f32, count: impl Fn(&Analyzer) -> u32) -> Vec<f64> {
         let mut a = Analyzer::new(SR);
         a.sensitivity = sens;
         let mut out = Vec::new();
         for chunk in sig.chunks(480) {
-            let before = a.kicks;
+            let before = count(&a);
             a.push(chunk);
-            if a.kicks != before {
+            if count(&a) != before {
                 out.push(a.t);
             }
         }
         out
+    }
+
+    #[test]
+    fn caisses_claires_trouvees_seules_et_avec_les_kicks() {
+        // caisses claires à 0,5 s, 1,5 s… 7,5 s ; à partir de 4 s, deux tombent avec un kick
+        let expected: Vec<f64> = (0..8).map(|k| k as f64 + 0.5).collect();
+        for snare in [140.0, 190.0, 230.0] {
+            for bass in [false, true] {
+                let hits = times(&render(snare, bass), 5.0, |a| a.caisses);
+                let found = expected.iter().filter(|&&k| hits.iter().any(|&h| h >= k && h < k + 0.06)).count();
+                assert!(found >= 7, "caisse {snare} Hz, basse {bass} : {found}/8 ({hits:?})");
+                assert!(hits.len() <= found + 1, "caisse {snare} Hz, basse {bass} : caisses en trop ({hits:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn kicks_seuls_ne_donnent_aucune_caisse_claire() {
+        for wobble in [6.0, 9.0, 14.0] {
+            let hits = times(&render_long_kicks(wobble), 5.0, |a| a.caisses);
+            assert!(hits.len() <= 1, "ondulation {wobble} Hz : caisses claires {hits:?}");
+        }
     }
 
     #[test]

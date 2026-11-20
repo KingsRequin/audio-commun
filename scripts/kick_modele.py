@@ -1,6 +1,7 @@
-"""Apprentissage du détecteur de kick (`src/kick.rs`) : écrit `src/kick_modele.rs`.
+"""Apprentissage des détecteurs de kick et de caisse claire (`src/kick.rs`) : écrit `src/kick_modele.rs`.
 
-Données : dossiers de `<nom>.f32` (mono, f32, 48 kHz) + `<nom>.kicks` (instants des vrais kicks),
+Données : dossiers de `<nom>.f32` (mono, f32, 48 kHz) + `<nom>.kicks` et `<nom>.caisses` (instants
+des vrais kicks et des vraies caisses claires ; un morceau sans `.caisses` ne sert qu'au kick),
 préparés par `kick_bench.py` (MDB Drums, morceaux transcrits par ADTOF) ou par ce script :
 
     python kick_modele.py synth <sortie> [n=120]           boîte à rythmes synthétique, étiquettes exactes
@@ -8,11 +9,13 @@ préparés par `kick_bench.py` (MDB Drums, morceaux transcrits par ADTOF) ou par
     python kick_modele.py valider <dossier>... [--leger <dossier>...]
     python kick_modele.py apprendre <kick_modele.rs> <dossier>... [--leger <dossier>...]
 
-`--leger dossier[@poids]` : dossiers qui servent seulement à l'apprentissage (variantes de MDB,
-synthétique), chaque morceau pesant `poids` (0,25 par défaut) d'un vrai morceau ; `valider` ne les évalue jamais et range les variantes d'un morceau
+`--leger dossier[@poids[/poids_caisse]]` : dossiers qui servent seulement à l'apprentissage (variantes
+de MDB, synthétique), chaque morceau pesant `poids` (0,25 par défaut) d'un vrai morceau, `poids_caisse`
+(par défaut le même) pour la caisse claire ; `valider` ne les évalue jamais et range les variantes d'un morceau
 dans le même groupe que lui. `valider` fait une validation croisée en 5 groupes de morceaux.
 
-Le détecteur reproduit en Rust, au pas de 5 ms, exactement les mesures calculées ici (`levels`,
+Les deux détecteurs jugent les mêmes attaques candidates avec les mêmes mesures ; chacun a ses trois
+réseaux. Le Rust reproduit au pas de 5 ms exactement les mesures calculées ici (`levels`, `macro`,
 `prep`, `candidates`, `features`) : tout changement doit être fait des deux côtés.
 
 Dépendances : numpy, scipy, torch (GPU si possible) ; ffmpeg pour `variantes`.
@@ -31,18 +34,22 @@ from scipy import signal
 SR = 48000
 HOP_N = 240  # 5 ms
 HOP = HOP_N / SR
-BANDS = [(None, 90), (90, 200), (200, 1000), (1000, 4000), (4000, None)]
+# 10 bandes fines ; les 5 larges (sub, 90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus) en sont des paires.
+BANDS = [(None, 50), (50, 90), (90, 140), (140, 200), (200, 450), (450, 1000), (1000, 2000), (2000, 4000), (4000, 8000), (8000, None)]
 STAGES = [2, 4, 6]  # décisions 10, 20, 30 ms après l'attaque
 PRE = 8
 P0 = [-8.0, -11.0, -12.0, -16.0, -18.0]  # références de départ (= START_PEAK en Rust)
 FPK0 = 35.0
 SUBPK0 = 0.015
 SILENCE_DB = -60.0
-H = 16
+H = 32
+EPOCHS = 20
 LIGHT = 0.25
-THRESHOLDS = [0.8, 0.7, 0.5]  # à sensibilité 5 (= STAGE_LOGIT en Rust)
-GAP = 0.1
-QUIET_S, QUIET_RAISE = 4.0, 1.5  # sans kick depuis 4 s, seuils relevés (logit)
+THRESHOLDS = [0.8, 0.7, 0.5]  # à sensibilité 5 (= STAGE_LOGIT en Rust) ; les mêmes pour la caisse claire
+GAP = 0.1  # kick ; caisse claire : SNARE_GAP
+SNARE_GAP = 0.05
+QUIET_S, QUIET_RAISE = 4.0, 1.5  # sans kick depuis 4 s, seuils relevés (logit) ; kick seulement
+KINDS = {"kick": ".kicks", "caisse": ".caisses"}
 
 
 # --- mesures (identiques au Rust) ------------------------------------------------------------
@@ -57,7 +64,7 @@ def rbj(f0, high):
 
 
 def levels(x):
-    """Niveau (dB) de chaque bande par pas de 5 ms, fenêtre 10 ms : (5, n)."""
+    """Niveau (dB) de chaque bande fine par pas de 5 ms, fenêtre 10 ms : (10, n)."""
     n = len(x) // HOP_N
     out = []
     for lo, hi in BANDS:
@@ -71,6 +78,12 @@ def levels(x):
         e = np.concatenate([[blk[0]], (blk[1:] + blk[:-1]) / 2])
         out.append(10 * np.log10(e + 1e-12))
     return np.array(out)
+
+
+def macro(Lf):
+    """Niveaux des 5 bandes larges (dB), somme des puissances de deux bandes fines voisines."""
+    e = 10 ** (Lf / 10)
+    return 10 * np.log10(e[0::2] + e[1::2])
 
 
 def prep(L):
@@ -110,11 +123,14 @@ def candidates(F, Fpk, tot):
     return p[m]
 
 
-def features(L, F, Fpk, P, tot, O, G, p, s):
+def features(Lf, L, F, Fpk, P, tot, O, G, p, s):
     pre = np.stack([L[:, q - PRE : q - 1].min(1) for q in p], 1)
+    pref = np.stack([Lf[:, q - PRE : q - 1].min(1) for q in p], 1)
     k = p + s
     f = [L[:, p + j] - pre for j in (1, 2, 4, 6) if j <= s]
     f += [L[:, k] - P[:, p - 1], L[:, k] - tot[k]]
+    f += [Lf[:, p + j] - pref for j in (1, 2, 4, 6) if j <= s]  # montée de chaque bande fine
+    f += [Lf[:, k] - tot[k]]  # spectre fin
     f = np.vstack(f).T
     extra = np.stack(
         [np.log(F[p] / Fpk[p - 1] + 1e-3), tot[k] - P[:, p - 1].max(0), pre[0] - P[0, p - 1], pre[1] - P[1, p - 1], O[k], G[k]], 1
@@ -123,21 +139,26 @@ def features(L, F, Fpk, P, tot, O, G, p, s):
 
 
 def track(base):
-    """Candidats d'un morceau : pas, mesures par étape, étiquette, kicks de référence."""
+    """Candidats d'un morceau : pas, mesures par étape, et pour chaque détecteur dont le morceau a
+    la référence (`KINDS`) : (étiquettes des candidats, instants de référence)."""
     x = np.fromfile(base.with_suffix(".f32"), dtype="<f4").astype(float)
-    with warnings.catch_warnings():  # morceau sans kick : fichier vide
-        warnings.simplefilter("ignore")
-        refs = np.loadtxt(base.with_suffix(".kicks"), ndmin=1)
-    L = levels(x)
+    Lf = levels(x)
+    L = macro(Lf)
     F, Fpk, P, tot, O, G = prep(L)
     p = candidates(F, Fpk, tot)
-    X = {s: features(L, F, Fpk, P, tot, O, G, p, s) for s in STAGES}
-    lab = np.array([np.any(np.abs(refs - t) <= 0.025) for t in p * HOP], dtype=bool)
-    return p, X, lab, refs
+    X = {s: features(Lf, L, F, Fpk, P, tot, O, G, p, s) for s in STAGES}
+    ref = {}
+    for kind, suffix in KINDS.items():
+        if base.with_suffix(suffix).exists():
+            with warnings.catch_warnings():  # morceau sans kick : fichier vide
+                warnings.simplefilter("ignore")
+                r = np.loadtxt(base.with_suffix(suffix), ndmin=1)
+            ref[kind] = (np.array([np.any(np.abs(r - t) <= 0.025) for t in p * HOP], dtype=bool), r)
+    return p, X, ref
 
 
 def load(dirs, light):
-    """`light` : {dossier: poids} des dossiers d'appoint (jamais évalués)."""
+    """`light` : {dossier: {détecteur: poids}} des dossiers d'appoint (jamais évalués)."""
     jobs = [(d, k.with_suffix(""), light.get(d)) for d in dirs for k in sorted(pathlib.Path(d).glob("*.kicks"))]
     with Pool(8) as pool:
         tracks = pool.map(track, [b for _, b, _ in jobs])
@@ -160,7 +181,7 @@ def fit(X, y, w):
     torch.manual_seed(0)
     net = torch.nn.Sequential(torch.nn.Linear(X.shape[1], H), torch.nn.Tanh(), torch.nn.Linear(H, 1)).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=3e-3, weight_decay=1e-5)
-    for _ in range(12):
+    for _ in range(EPOCHS):
         perm = torch.randperm(len(y), device=dev)
         for i in range(0, len(y), 4096):
             b = perm[i : i + 4096]
@@ -186,22 +207,24 @@ def logit(m, X):
     return np.tanh(X @ m["w"].T + m["b"]) @ m["v"] + m["c"]
 
 
-def train_all(tracks):
-    y = np.concatenate([t[2] for _, _, t in tracks]).astype(np.float32)
+def train_all(tracks, kind):
+    tracks = [t for t in tracks if kind in t[2][2]]
+    y = np.concatenate([t[2][kind][0] for _, _, t in tracks]).astype(np.float32)
     # chaque morceau pèse autant, quelle que soit sa longueur ; les données légères, un quart
-    w = np.concatenate([np.full(len(t[2]), (lt if lt is not None else 1.0) / (len(t[2]) + 1.0)) for _, lt, t in tracks])
+    w = np.concatenate([np.full(len(t[0]), (lt[kind] if lt is not None else 1.0) / (len(t[0]) + 1.0)) for _, lt, t in tracks])
     w = (w / w.mean()).astype(np.float32)
     return {s: fit(np.vstack([t[1][s] for _, _, t in tracks]), y, w) for s in STAGES}
 
 
-def simulate(p, scores, refs):
+def simulate(p, scores, refs, kind):
     det, last = [], -9.0
     thr = [np.log(t / (1 - t)) for t in THRESHOLDS]
+    gap = GAP if kind == "kick" else SNARE_GAP
     for i, pi in enumerate(p):
         t = pi * HOP
-        if t - last <= GAP:
+        if t - last <= gap:
             continue
-        quiet = QUIET_RAISE if t - last > QUIET_S else 0.0
+        quiet = QUIET_RAISE if kind == "kick" and t - last > QUIET_S else 0.0
         for k, s in enumerate(STAGES):
             if scores[s][i] > thr[k] + quiet:
                 det.append((pi + s + 1) * HOP)
@@ -222,32 +245,38 @@ def validate(tracks):
     fold = dict(zip(sorted(base(n) for n in evald), np.random.default_rng(0).permutation(len(evald)) % 5))
     tot = {}
     for f in range(5):
-        models = train_all([t for t in tracks if fold.get(base(t[0]), -1) != f])
-        for n, lt, (p, X, lab, refs) in tracks:
-            if lt is None and fold[base(n)] == f:
-                r = simulate(p, {s: logit(models[s], X[s]) for s in STAGES}, refs)
-                tot.setdefault(n.split("/")[0], np.zeros(3))
-                tot[n.split("/")[0]] += r
-    for d, r in tot.items():
+        train = [t for t in tracks if fold.get(base(t[0]), -1) != f]
+        for kind in KINDS:
+            models = train_all(train, kind)
+            for n, lt, (p, X, ref) in tracks:
+                if lt is None and fold[base(n)] == f and kind in ref:
+                    r = simulate(p, {s: logit(models[s], X[s]) for s in STAGES}, ref[kind][1], kind)
+                    tot.setdefault((kind, n.split("/")[0]), np.zeros(3))
+                    tot[(kind, n.split("/")[0])] += r
+    for (kind, d), r in sorted(tot.items()):
         pr, rc = r[0] / max(r[1], 1), r[0] / max(r[2], 1)
-        print(f"{d:12} précision {pr:.3f} rappel {rc:.3f} F1 {2 * pr * rc / max(pr + rc, 1e-9):.3f}")
+        print(f"{kind:7} {d:12} précision {pr:.3f} rappel {rc:.3f} F1 {2 * pr * rc / max(pr + rc, 1e-9):.3f}")
 
 
 def write_rust(models, path):
     fmt = lambda v: np.format_float_scientific(np.float32(v), unique=True, trim="0")  # plus court f32 exact
     out = [
         "// Généré par scripts/kick_modele.py (apprendre) : ne pas modifier à la main.",
-        "// Trois petits réseaux (entrées → 16 tanh → 1), un par instant de décision après l'attaque ;",
-        "// la normalisation des entrées est intégrée à la première couche.",
+        f"// Par détecteur (kick, caisse claire), trois petits réseaux (entrées → {H} tanh → 1), un par",
+        "// instant de décision après l'attaque ; la normalisation des entrées est intégrée à la première couche.",
         "",
         "use crate::kick::Net;",
         "",
+        f"pub(crate) const H: usize = {H};",
     ]
     for s in STAGES:
-        m = models[s]
-        out.append(f"pub(crate) const N{s}: usize = {m['w'].shape[1]};")
-        out.append(f"/// Décision {s * 5} ms après l'attaque.")
-        out.append(f"pub(crate) static NET{s}: Net<N{s}> = Net {{")
+        out.append(f"pub(crate) const N{s}: usize = {models['kick'][s]['w'].shape[1]};")
+    out.append("")
+    for kind, s in [(k, s) for k in KINDS for s in STAGES]:
+        m = models[kind][s]
+        name = {"kick": "KICK", "caisse": "CAISSE"}[kind]
+        out.append(f"/// {'Kick' if kind == 'kick' else 'Caisse claire'} : décision {s * 5} ms après l'attaque.")
+        out.append(f"pub(crate) static {name}{s}: Net<N{s}> = Net {{")
         out.append("    w: [")
         out += ["        [" + ", ".join(fmt(v) for v in row) + "]," for row in m["w"]]
         out.append("    ],")
@@ -266,7 +295,11 @@ def write_rust(models, path):
 
 
 def synth_clip(rng, dur=30.0):
-    """Extrait de boîte à rythmes aux paramètres tirés au hasard ; renvoie (signal, kicks)."""
+    """Extrait de boîte à rythmes aux paramètres tirés au hasard ; renvoie (signal, kicks, caisses).
+
+    Pour la caisse claire, ces extraits pèsent peu (`synth@0.25/0.1`) : à 0,25 ils faisaient baisser
+    sa précision sur la vraie musique (F1 0,645 → 0,621) ; sans eux, une caisse claire de boîte à
+    rythmes toute simple n'était plus reconnue."""
     n = int(SR * dur)
     t = np.arange(n) / SR
     out = rng.normal(0, 10 ** rng.uniform(-3.5, -2), n)
@@ -301,7 +334,10 @@ def synth_clip(rng, dur=30.0):
     slen = int(SR * 0.25)
     ts = np.arange(slen) / SR
 
+    snares = []
+
     def snare(at, g):
+        snares.append(at)
         i = int(at * SR)
         j = min(n, i + slen)
         snd = (rng.normal(0, noise_amt, slen) + np.sin(2 * np.pi * body * ts) * (1 - noise_amt * 0.5)) * np.exp(-ts * sdec)
@@ -338,12 +374,14 @@ def synth_clip(rng, dur=30.0):
             env *= 1 - 0.9 * np.exp(-(t % beat) * 12)
         out += rng.uniform(0.1, 0.5) * wave * env
     out *= 0.9 / (np.abs(out).max() + 1e-9)
-    return out.astype("<f4"), kicks
+    return out.astype("<f4"), kicks, sorted(snares)
 
 
-def save(dest, name, x, kicks):
+def save(dest, name, x, kicks, snares=None):
     x.astype("<f4").tofile(dest / f"{name}.f32")
     (dest / f"{name}.kicks").write_text("".join(f"{v:.4f}\n" for v in kicks))
+    if snares is not None:
+        (dest / f"{name}.caisses").write_text("".join(f"{v:.4f}\n" for v in snares))
 
 
 def variants(root, dest):
@@ -358,10 +396,11 @@ def variants(root, dest):
         stems = [(dec(d / f"{d.name}_STEMS" / f), "drum set" in inst) for f, inst in re.findall(r"filename: (\S+_STEM_\d+\.wav)\n    instrument: ([^\n]+)", meta)]
         n = min(len(s) for s, _ in stems)
         ann = (root / "annotations" / "class" / f"{d.name}_class.txt").read_text().splitlines()
-        kicks = sorted({float(l.split()[0]) for l in ann if "KD" in l})
+        kicks = sorted({float(l.split()[0]) for l in ann if l.split()[1:] == ["KD"]})
+        snares = sorted({float(l.split()[0]) for l in ann if l.split()[1:] == ["SD"]})
         for v in range(4):
             mix = sum(s[:n] * 10 ** ((rng.uniform(-8, 0) if drum else rng.uniform(-3, 6)) / 20) for s, drum in stems)
-            save(dest, f"{d.name}_v{v}", mix * 0.9 / (np.abs(mix).max() + 1e-9), kicks)
+            save(dest, f"{d.name}_v{v}", mix * 0.9 / (np.abs(mix).max() + 1e-9), kicks, snares)
         print(d.name, flush=True)
 
 
@@ -373,7 +412,9 @@ def main():
         i = args.index("--leger")
         for a in args[i + 1 :]:
             d, _, w = a.partition("@")
-            light[d] = float(w) if w else LIGHT
+            wk, _, ws = w.partition("/")
+            wk = float(wk) if wk else LIGHT
+            light[d] = {"kick": wk, "caisse": float(ws) if ws else wk}
         args = args[:i]
     if not args:
         sys.exit(__doc__)
@@ -391,7 +432,8 @@ def main():
     elif mode == "valider":
         validate(load(args[1:] + list(light), light))
     elif mode == "apprendre":
-        write_rust(train_all(load(args[2:] + list(light), light)), args[1])
+        tracks = load(args[2:] + list(light), light)
+        write_rust({kind: train_all(tracks, kind) for kind in KINDS}, args[1])
     else:
         sys.exit(__doc__)
 

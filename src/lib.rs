@@ -6,8 +6,8 @@
 //!   Ce qu'on fait des échantillons est laissé au [`capture::Sink`].
 //! - [`spectre`] : analyse par FFT (bandes mel, attaques, tempo, intensité, tonalité), à cadence
 //!   fixe ; [`spectre::start`] la branche sur la capture.
-//! - [`kick`] : détection de grosse caisse à très faible délai (biquads, sans FFT), niveau et
-//!   hauteur de la basse ; utilisée par Essaim, qui veut réagir en 10 à 20 ms.
+//! - [`kick`] : détection de grosse caisse et de caisse claire à très faible délai (biquads,
+//!   sans FFT), niveau et hauteur de la basse ; utilisée par Essaim, qui veut réagir en 10 à 20 ms.
 //! - [`pulsation`] : tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans
 //!   FFT ; relais pendant un passage sans kick.
 //!

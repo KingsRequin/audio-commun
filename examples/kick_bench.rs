@@ -10,6 +10,9 @@
 //! (le détecteur est causal : il répond après l'attaque). Affiche par morceau la précision
 //! (part des kicks détectés qui sont vrais), le rappel (part des vrais kicks trouvés), le score
 //! F1, le délai médian et les faux kicks dans l'intro (avant le premier vrai kick).
+//!
+//! Si `<nom>.caisses` existe (instants des vraies caisses claires), les caisses claires
+//! détectées sont jugées de même ; leur total est affiché à la fin.
 
 use audio_commun::kick::Analyzer;
 use std::path::Path;
@@ -43,20 +46,30 @@ impl Score {
     }
 }
 
-fn detect(samples: &[f32], sens: f32, gap: f64) -> Vec<f64> {
+/// Instants des kicks et des caisses claires détectés.
+fn detect(samples: &[f32], sens: f32, gap: f64) -> (Vec<f64>, Vec<f64>) {
     let mut a = Analyzer::new(SR);
     a.sensitivity = sens;
     a.min_gap_s = gap;
-    let mut out = Vec::new();
+    let (mut kicks, mut snares) = (Vec::new(), Vec::new());
     // Paquets de 10 ms, comme la capture : l'instant noté est la fin du paquet.
     for chunk in samples.chunks(480) {
-        let before = a.kicks;
+        let before = (a.kicks, a.caisses);
         a.push(chunk);
-        if a.kicks != before {
-            out.push(a.t);
+        if a.kicks != before.0 {
+            kicks.push(a.t);
+        }
+        if a.caisses != before.1 {
+            snares.push(a.t);
         }
     }
-    out
+    (kicks, snares)
+}
+
+fn read_times(path: &Path) -> std::io::Result<Vec<f64>> {
+    let mut v: Vec<f64> = std::fs::read_to_string(path)?.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
+    v.sort_by(f64::total_cmp);
+    Ok(v)
 }
 
 fn score(refs: &[f64], hits: &[f64]) -> Score {
@@ -110,18 +123,22 @@ fn main() -> std::io::Result<()> {
 
     println!("{:<44} {:>5} {:>5} {:>6} {:>6} {:>6} {:>7} {:>5}", "morceau", "réf", "dét", "préc", "rappel", "F1", "délai", "intro");
     let mut total = Score { refs: 0, hits: 0, tp: 0, intro_fp: 0, delays: Vec::new() };
+    let mut snare_total = Score { refs: 0, hits: 0, tp: 0, intro_fp: 0, delays: Vec::new() };
     let mut f1_sum = 0.0;
     for name in &names {
         let base = Path::new(dir.as_str()).join(name);
         let bytes = std::fs::read(base.with_extension("f32"))?;
         let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-        let mut refs: Vec<f64> = std::fs::read_to_string(base.with_extension("kicks"))?
-            .lines()
-            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
-            .collect();
-        refs.sort_by(f64::total_cmp);
-        let hits = detect(&samples, sens, gap);
+        let refs = read_times(&base.with_extension("kicks"))?;
+        let (hits, snares) = detect(&samples, sens, gap);
         let mut s = score(&refs, &hits);
+        if let Ok(snare_refs) = read_times(&base.with_extension("caisses")) {
+            let mut c = score(&snare_refs, &snares);
+            snare_total.refs += c.refs;
+            snare_total.hits += c.hits;
+            snare_total.tp += c.tp;
+            snare_total.delays.append(&mut c.delays);
+        }
         let label: String = name.chars().take(44).collect();
         println!(
             "{:<44} {:>5} {:>5} {:>6.2} {:>6.2} {:>6.2} {:>5.0}ms {:>5}",
@@ -161,5 +178,16 @@ fn main() -> std::io::Result<()> {
         total.intro_fp
     );
     println!("F1 moyen par morceau : {:.3}", f1_sum / names.len().max(1) as f64);
+    if snare_total.refs > 0 {
+        println!(
+            "CAISSES CLAIRES : réf {} dét {} préc {:.2} rappel {:.2} F1 {:.3} délai médian {:.0} ms",
+            snare_total.refs,
+            snare_total.hits,
+            snare_total.precision(),
+            snare_total.recall(),
+            snare_total.f1(),
+            median(&mut snare_total.delays) * 1000.0
+        );
+    }
     Ok(())
 }
