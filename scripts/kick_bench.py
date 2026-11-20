@@ -1,10 +1,11 @@
 """Prépare les données du banc d'essai du kick (`examples/kick_bench.rs`).
 
-Pour chaque morceau : `<nom>.f32` (mélange complet, mono, f32, 48 kHz) et `<nom>.kicks` (instants
-des vrais kicks, en secondes).
+Pour chaque morceau : `<nom>.f32` (mélange complet, mono, f32, 48 kHz), `<nom>.kicks` et
+`<nom>.caisses` (instants des vrais kicks et des vraies caisses claires, en secondes).
 
     python kick_bench.py mdb <dossier MDB Drums> <sortie>        annotations humaines de MDB Drums
     python kick_bench.py ref <sortie> <fichier ou dossier>...    n'importe quel morceau (référence ADTOF)
+    python kick_bench.py caisses <sortie> [--demucs]             `.caisses` des morceaux déjà préparés (ADTOF)
     python kick_bench.py valide <dossier MDB Drums> [--demucs]   ADTOF comparé aux annotations de MDB
 
 La référence d'un morceau quelconque vient d'ADTOF (transcription de batterie par réseau de neurones,
@@ -58,8 +59,8 @@ def write_wav(mono, sr, path):
 _adtof = None
 
 
-def adtof_kicks(mono, sr):
-    """Instants des kicks (note 35) transcrits par ADTOF."""
+def adtof_notes(mono, sr):
+    """Instants transcrits par ADTOF, par note MIDI (35 kick, 38 caisse claire, 42 charleston…)."""
     global _adtof
     import torch
     from adtof_pytorch import (
@@ -85,7 +86,7 @@ def adtof_kicks(mono, sr):
     with torch.no_grad():
         pred = _adtof(x).cpu().numpy()
     peaks = PeakPicker(thresholds=FRAME_RNN_THRESHOLDS, fps=100).pick(pred, labels=LABELS_5)[0]
-    return sorted(peaks.get(35, []))
+    return {k: sorted(v) for k, v in peaks.items()}
 
 
 # --- Demucs ------------------------------------------------------------------------------------
@@ -116,16 +117,17 @@ def separate_drums(stereo48):
 def reference(stereo, use_demucs):
     if use_demucs:
         drums, sr = separate_drums(stereo)
-        return adtof_kicks(drums, sr)
-    return adtof_kicks(stereo.mean(axis=0), SR)
+        return adtof_notes(drums, sr)
+    return adtof_notes(stereo.mean(axis=0), SR)
 
 
 def mdb_tracks(root):
     for mix in sorted((root / "audio" / "full_mix").glob("*_MIX.wav")):
         name = mix.stem.removesuffix("_MIX")
         ann = root / "annotations" / "class" / f"{name}_class.txt"
-        kicks = sorted({float(l.split()[0]) for l in ann.read_text().splitlines() if "KD" in l})
-        yield name, mix, kicks
+        lines = ann.read_text().splitlines()
+        notes = {c: sorted({float(l.split()[0]) for l in lines if l.split()[1:] == [c]}) for c in ("KD", "SD")}
+        yield name, mix, notes["KD"], notes["SD"]
 
 
 def safe_name(p):
@@ -143,14 +145,15 @@ def main():
     if mode == "mdb":
         root, out = pathlib.Path(args[1]), pathlib.Path(args[2])
         out.mkdir(parents=True, exist_ok=True)
-        for name, mix, kicks in mdb_tracks(root):
+        for name, mix, kicks, snares in mdb_tracks(root):
             load(mix).mean(axis=0).astype("<f4").tofile(out / f"{name}.f32")
             save_kicks(kicks, out / f"{name}.kicks")
+            save_kicks(snares, out / f"{name}.caisses")
             print(f"{name} : {len(kicks)} kicks", flush=True)
     elif mode == "valide":
         tot = [0, 0, 0]
-        for name, mix, ref in mdb_tracks(pathlib.Path(args[1])):
-            got = reference(load(mix), use_demucs)
+        for name, mix, ref, _ in mdb_tracks(pathlib.Path(args[1])):
+            got = reference(load(mix), use_demucs).get(35, [])
             used, tp = set(), 0
             for g in got:
                 m = [i for i, r in enumerate(ref) if i not in used and abs(g - r) <= TOL]
@@ -174,13 +177,22 @@ def main():
                 continue
             try:
                 stereo = load(f)
-                kicks = reference(stereo, use_demucs)
+                notes = reference(stereo, use_demucs)
             except Exception as e:  # fichier illisible : on passe au suivant
                 print(f"{name} : ÉCHEC {e}", flush=True)
                 continue
             stereo.mean(axis=0).astype("<f4").tofile(out / f"{name}.f32")
-            save_kicks(kicks, out / f"{name}.kicks")
-            print(f"{name} : {len(kicks)} kicks", flush=True)
+            save_kicks(notes.get(35, []), out / f"{name}.kicks")
+            save_kicks(notes.get(38, []), out / f"{name}.caisses")
+            print(f"{name} : {len(notes.get(35, []))} kicks, {len(notes.get(38, []))} caisses claires", flush=True)
+    elif mode == "caisses":
+        for f in sorted(pathlib.Path(args[1]).glob("*.f32")):
+            if f.with_suffix(".caisses").exists():
+                continue
+            mono = np.fromfile(f, dtype="<f4")
+            snares = reference(np.stack([mono, mono]), use_demucs).get(38, [])
+            save_kicks(snares, f.with_suffix(".caisses"))
+            print(f"{f.stem} : {len(snares)} caisses claires", flush=True)
     else:
         sys.exit(__doc__)
 
