@@ -5,7 +5,8 @@ Pour chaque morceau : `<nom>.f32` (mélange complet, mono, f32, 48 kHz), `<nom>.
 `--demucs`, `<nom>.kicks_doute` et `<nom>.caisses_doute` (instants où la référence est incertaine).
 
     python kick_bench.py mdb <dossier MDB Drums> <sortie>        annotations humaines de MDB Drums
-    python kick_bench.py ref <sortie> <fichier ou dossier>...    n'importe quel morceau (référence ADTOF)
+    python kick_bench.py ref <sortie> <fichier ou dossier>...    n'importe quel morceau (référence ADTOF) ;
+                                                                 un `.f32` déjà dans <sortie> y reste
     python kick_bench.py valide <dossier MDB Drums> [--demucs]   ADTOF comparé aux annotations de MDB
 
 La référence d'un morceau quelconque vient d'ADTOF (transcription de batterie par réseau de neurones,
@@ -32,11 +33,15 @@ from scipy import signal
 
 SR = 48000
 TOL = 0.03  # tolérance de `valide` (s)
-AUDIO = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".webm"}
+AUDIO = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".webm", ".f32"}
 
 
 def load(path, sr=SR):
-    """Décode n'importe quel fichier audio en stéréo float32 (2, n) via ffmpeg."""
+    """Décode n'importe quel fichier audio en stéréo float32 (2, n) via ffmpeg ; un `.f32` est déjà
+    décodé (mono, f32, 48 kHz : le format de sortie de ce script)."""
+    if pathlib.Path(path).suffix == ".f32":
+        mono = np.fromfile(path, dtype="<f4")
+        return np.stack([mono, mono])
     raw = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "2", "-ar", str(sr), "-"],
         check=True,
@@ -201,7 +206,7 @@ def main():
         for a in map(pathlib.Path, args[2:]):
             files += sorted(p for p in a.iterdir() if p.suffix.lower() in AUDIO) if a.is_dir() else [a]
         for f in files:
-            name = safe_name(f)
+            name = f.stem if f.suffix == ".f32" else safe_name(f)
             if (out / f"{name}.kicks").exists():
                 continue
             try:
@@ -210,8 +215,9 @@ def main():
             except Exception as e:  # fichier illisible : on passe au suivant
                 print(f"{name} : ÉCHEC {e}", flush=True)
                 continue
-            stereo.mean(axis=0).astype("<f4").tofile(out / f"{name}.f32")
-            for note, suffix in ((35, ".kicks"), (38, ".caisses")):
+            if f.resolve() != (out / f"{name}.f32").resolve():
+                stereo.mean(axis=0).astype("<f4").tofile(out / f"{name}.f32")
+            for note, suffix in ((38, ".caisses"), (35, ".kicks")):  # `.kicks` en dernier : il marque le morceau fait
                 save_kicks(notes.get(note, []), out / f"{name}{suffix}")
                 if use_demucs:
                     save_kicks(doubt.get(note, []), out / f"{name}{suffix}_doute")
