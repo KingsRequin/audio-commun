@@ -598,8 +598,9 @@ impl Analyzer {
         self.snare = juge;
     }
 
-    /// Juge les candidats de `juge` dont une étape de décision tombe sur le pas `i` ; renvoie le
-    /// nombre de coups reconnus.
+    /// Juge les candidats de `juge` dont une étape de décision tombe sur le pas `i`, du plus
+    /// ancien au plus récent (ordre repris par `decisions` du script) ; renvoie le nombre de coups
+    /// reconnus.
     fn decide(&self, juge: &mut Juge, i: u64) -> u32 {
         let kick = juge.coup == Coup::Kick;
         // La sensibilité règle le dernier seuil du kick (combien de kicks) ; les décisions
@@ -623,12 +624,12 @@ impl Analyzer {
             if since > gap && self.score(juge.coup, p, STAGES[stage]) > thr {
                 found += 1;
                 juge.last_attack = attack;
-                juge.pending.swap_remove(k);
+                juge.pending.remove(k);
             } else if stage + 1 < STAGES.len() {
                 juge.pending[k].stage += 1;
                 k += 1;
             } else {
-                juge.pending.swap_remove(k);
+                juge.pending.remove(k);
             }
         }
         found

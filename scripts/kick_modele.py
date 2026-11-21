@@ -7,7 +7,7 @@ ni coup ni non-coup, ignorés à l'apprentissage comme à l'évaluation). Prépa
 (MDB Drums, morceaux transcrits par ADTOF), `kick_remix.py` (batterie refaite, instants exacts) ou
 par ce script :
 
-    python kick_modele.py synth <sortie> [n=120]           boîte à rythmes synthétique, étiquettes exactes
+    python kick_modele.py synth <sortie> [n=300]           boîte à rythmes synthétique, étiquettes exactes
     python kick_modele.py variantes <dossier MDB> <sortie>  4 remixages de chaque morceau de MDB (pistes séparées)
     python kick_modele.py valider <dossier>... [--leger <dossier>...] [--essai <dossier>...]
     python kick_modele.py apprendre <kick_modele.rs> <dossier>... [--leger <dossier>...]
@@ -17,8 +17,10 @@ par ce script :
 `--leger`) d'un vrai morceau, `poids_caisse` (par défaut le même) pour la caisse claire. Les dossiers
 `--leger` servent seulement à l'apprentissage, les dossiers `--essai` seulement à l'évaluation ;
 `valider` fait une validation croisée en 5 groupes de morceaux et range `<nom>_v<k>` (variante,
-remixage) dans le groupe de `<nom>`. Un dossier sans aucun coup de référence (voix, musique sans
-batterie) est noté en faux coups par minute.
+remixage) dans le groupe de `<nom>`. Y sont évalués les dossiers de poids 1 et ceux de `--essai` ; un
+dossier d'apprentissage d'un autre poids répété après `--essai` (`neg@.5 ... --essai neg`) est évalué
+de même, chaque morceau par le modèle qui ne l'a pas appris. Un dossier sans aucun coup de référence
+(voix, musique sans batterie) est noté en faux coups par minute.
 
 Modèle : un petit réseau récurrent (GRU) lit à chaque pas de 5 ms les niveaux des 10 bandes et garde
 le contexte (rythme, coups récents, nature du son) ; chaque attaque candidate est jugée 10, 20 et
@@ -352,20 +354,21 @@ def predict(model, C, i):
 
 
 def decisions(p, scores, kind):
-    """Instants des coups annoncés (comme `decide` en Rust) ; scores : (candidats, étapes)."""
-    det, last = [], -9.0
+    """Instants des coups annoncés ; scores : (candidats, étapes). Comme `decide` en Rust, chaque
+    étape d'un candidat est jugée à son pas (attaque + étape), dans l'ordre du temps et, au même
+    pas, le candidat le plus ancien d'abord : la décision à 10 ms d'une attaque peut précéder celle
+    à 30 ms de l'attaque d'avant."""
     thr = np.array([np.log(t / (1 - t)) for t in THRESHOLDS])
     gap = GAP if kind == "kick" else SNARE_GAP
-    for i in np.flatnonzero((scores > thr).any(1)):
-        t = p[i] * HOP
-        if t - last <= gap:
-            continue
-        quiet = QUIET_RAISE if kind == "kick" and t - last > QUIET_S else 0.0
-        for k, s in enumerate(STAGES):
-            if scores[i, k] > thr[k] + quiet:
-                det.append((p[i] + s + 1) * HOP)
-                last = t
-                break
+    events = sorted((p[i] + s, p[i], k, i) for i in np.flatnonzero((scores > thr).any(1)) for k, s in enumerate(STAGES))
+    det, last, done = [], -9.0, set()
+    for when, attack, k, i in events:
+        since = attack * HOP - last
+        quiet = QUIET_RAISE if kind == "kick" and since > QUIET_S else 0.0
+        if i not in done and since > gap and scores[i, k] > thr[k] + quiet:
+            det.append((when + 1) * HOP)
+            last = attack * HOP
+            done.add(i)
     return det
 
 
@@ -512,14 +515,19 @@ def synth_clip(rng, dur=30.0):
     steps = int(dur / step)
     style = rng.choice(["four", "rock", "trap", "none"], p=[0.25, 0.2, 0.15, 0.4])
     kicks = []
-    # kick : sinus qui descend, avec ou sans clic, saturé ou non
-    f0, f1 = rng.uniform(70, 220), rng.uniform(38, 65)
-    sweep, decay = rng.uniform(12, 45), rng.uniform(3, 16)
+    # kick : sinus qui descend, avec ou sans clic, saturé ou non ; un sur quatre est long (808),
+    # parfois avec une ondulation d'amplitude
+    long_kick = rng.random() < 0.25
+    f0, f1 = rng.uniform(70, 110 if long_kick else 220), rng.uniform(38, 65)
+    sweep, decay = rng.uniform(12, 45), rng.uniform(1.5, 4) if long_kick else rng.uniform(3, 16)
     click = rng.choice([0.0, rng.uniform(0.05, 0.6)])
     drive = rng.choice([1.0, rng.uniform(2, 8)], p=[0.7, 0.3])
-    klen = int(SR * min(0.6, 5 / decay))
+    klen = int(SR * min(1.2 if long_kick else 0.6, 5 / decay))
     tk = np.arange(klen) / SR
     kick = np.sin(2 * np.pi * (f1 * tk + (f0 - f1) * (1 - np.exp(-tk * sweep)) / sweep)) * np.exp(-tk * decay)
+    if long_kick and rng.random() < 0.6:
+        depth = rng.uniform(0.15, 0.45)
+        kick *= 1 - depth + depth * np.cos(2 * np.pi * rng.uniform(4, 16) * tk)
     if click:
         c = rng.normal(0, 1, int(SR * 0.004)) * np.exp(-np.arange(int(SR * 0.004)) / (SR * 0.001))
         kick[: len(c)] += click * np.diff(c, prepend=0)
@@ -532,7 +540,10 @@ def synth_clip(rng, dur=30.0):
             j = min(n, i + klen)
             out[i:j] += kick[: j - i]
             kicks.append(i / SR)
-    # caisse claire sur 2 et 4, notes fantômes, et parfois un roulement (montée d'EDM)
+    # caisse claire sur 2 et 4, notes fantômes, et parfois un roulement (montée d'EDM) ; un extrait
+    # sur trois n'en a aucune (kicks et charleston seuls : un charleston frappé avec le kick n'en
+    # est pas une)
+    backbeat = rng.random() < 0.67
     body, sdec = rng.uniform(130, 260), rng.uniform(12, 35)
     noise_amt, sgain = rng.uniform(0.2, 0.8), rng.uniform(0.3, 0.9)
     slen = int(SR * 0.25)
@@ -547,19 +558,19 @@ def synth_clip(rng, dur=30.0):
         snd = (rng.normal(0, noise_amt, slen) + np.sin(2 * np.pi * body * ts) * (1 - noise_amt * 0.5)) * np.exp(-ts * sdec)
         out[i:j] += g * snd[: j - i]
 
-    roll_at, roll_every = (int(rng.uniform(0, steps * 0.6)), rng.choice([1, 2])) if rng.random() < 0.5 else (-1, 1)
+    roll_at, roll_every = (int(rng.uniform(0, steps * 0.6)), rng.choice([1, 2])) if backbeat and rng.random() < 0.5 else (-1, 1)
     roll_len = int(rng.uniform(16, 64))
     for s in range(steps):
         if roll_at <= s < roll_at + roll_len:
             if s % roll_every == 0:
                 for sub in range(2 if roll_every == 1 and rng.random() < 0.3 else 1):
                     snare((s + sub * 0.5) * step, sgain * rng.uniform(0.5, 1.0))
-        elif s % 16 in (4, 12):
+        elif backbeat and s % 16 in (4, 12):
             snare(s * step, sgain)
-        elif rng.random() < 0.04:
+        elif backbeat and rng.random() < 0.04:
             snare(s * step, sgain * 0.3)
     # charleston
-    hgain, hlen = rng.uniform(0.03, 0.2), int(SR * 0.05)
+    hgain, hlen = rng.uniform(0.03, 0.3), int(SR * 0.05)
     th = np.arange(hlen) / SR
     for s in range(0, steps, rng.choice([1, 2])):
         i = int(s * step * SR)
@@ -618,7 +629,7 @@ def main():
         dest = pathlib.Path(args[0])
         dest.mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(12345)
-        for k in range(int(args[1]) if len(args) > 1 else 120):
+        for k in range(int(args[1]) if len(args) > 1 else 300):
             save(dest, f"synth_{k:03}", *synth_clip(rng))
     elif mode == "variantes":
         dest = pathlib.Path(args[1])
@@ -641,7 +652,7 @@ def main():
             wk, _, ws = w.partition("/")
             wk = float(wk) if wk else default
             weights[d] = (wk, float(ws) if ws else wk)
-        data = load(list(weights) + (tests if mode == "valider" else []))
+        data = load(list(dict.fromkeys(list(weights) + (tests if mode == "valider" else []))))
         if mode == "valider":
             validate(data, weights, tests)
         else:
