@@ -9,7 +9,7 @@ par ce script :
 
     python kick_modele.py synth <sortie> [n=300]           boîte à rythmes synthétique, étiquettes exactes
     python kick_modele.py variantes <dossier MDB> <sortie>  4 remixages de chaque morceau de MDB (pistes séparées)
-    python kick_modele.py valider <dossier>... [--leger <dossier>...] [--essai <dossier>...]
+    python kick_modele.py valider <dossier>... [--leger <dossier>...] [--essai <dossier>...] [--reprise <fichier>]
     python kick_modele.py apprendre <kick_modele.rs> <dossier>... [--leger <dossier>...]
     python kick_modele.py detecter <kick_modele.rs> <morceau.f32>   coups trouvés par le modèle écrit (calcul en Python)
 
@@ -20,7 +20,9 @@ par ce script :
 remixage) dans le groupe de `<nom>`. Y sont évalués les dossiers de poids 1 et ceux de `--essai` ; un
 dossier d'apprentissage d'un autre poids répété après `--essai` (`neg@.5 ... --essai neg`) est évalué
 de même, chaque morceau par le modèle qui ne l'a pas appris. Un dossier sans aucun coup de référence
-(voix, musique sans batterie) est noté en faux coups par minute.
+(voix, musique sans batterie) est noté en faux coups par minute. Avec `--reprise <fichier>`, chaque
+groupe fini (5 minutes) y est noté : relancée avec les mêmes arguments, une validation interrompue
+reprend au groupe suivant ; le fichier est effacé à la fin.
 
 Modèle : un petit réseau récurrent (GRU) lit à chaque pas de 5 ms les niveaux des 10 bandes et garde
 le contexte (rythme, coups récents, nature du son) ; chaque attaque candidate est jugée 10, 20 et
@@ -36,6 +38,7 @@ change). Dépendances : numpy, scipy, torch (GPU conseillé) ; ffmpeg pour `vari
 """
 
 import ast
+import json
 import pathlib
 import re
 import subprocess
@@ -392,16 +395,25 @@ def base_name(n):
     return re.sub(r"_v\d$", "", n)
 
 
-def validate(data, weights, tests):
+def validate(data, weights, tests, resume=None):
     """weights : {dossier: (poids kick, poids caisse)} des dossiers d'apprentissage ; un dossier est
-    évalué s'il pèse 1 (vrai morceau) ou s'il est dans `tests`."""
+    évalué s'il pèse 1 (vrai morceau) ou s'il est dans `tests`. `resume` : fichier où sont notés les
+    groupes finis, pour qu'une validation interrompue reprenne au groupe suivant (les groupes sont
+    indépendants : chaque apprentissage repart de la même graine)."""
     C = Corpus(data)
     evald = [d for d in data if d in tests or weights.get(d, (0,))[0] == 1]
     names = sorted({base_name(t["name"]) for t in C.tracks if t["dir"] in evald})
     fold = dict(zip(names, np.random.default_rng(0).permutation(len(names)) % 5))
     group = lambda t: fold.get(base_name(t["name"]), -1)
-    tot = {}
-    for f in range(5):
+    sig = repr((sorted(weights.items()), sorted(tests), len(C.tracks)))
+    state = {"sig": sig, "done": 0, "tot": {}}
+    if resume and resume.exists():
+        old = json.loads(resume.read_text(encoding="utf-8"))
+        if old["sig"] == sig:
+            state = old
+            print(f"reprise après le groupe {state['done']}/5", flush=True)
+    tot = {tuple(k.split("|")): np.array(v) for k, v in state["tot"].items()}
+    for f in range(state["done"], 5):
         model = train(C, {i: weights[t["dir"]] for i, t in enumerate(C.tracks) if t["dir"] in weights and group(t) != f})
         for i, t in enumerate(C.tracks):
             if t["dir"] in evald and group(t) == f:
@@ -412,12 +424,17 @@ def validate(data, weights, tests):
                         tot.setdefault(key, np.zeros(4))
                         tot[key] += [*simulate(t["p"], o[:, :, ki], t["ref"][kind], kind, t["doubt"][kind]), t["n"] * HOP]
         print(f"groupe {f + 1}/5", flush=True)
+        if resume:
+            state = {"sig": sig, "done": f + 1, "tot": {"|".join(k): v.tolist() for k, v in tot.items()}}
+            resume.write_text(json.dumps(state), encoding="utf-8")
     for (kind, d), r in sorted(tot.items()):
         if r[2] == 0:
             print(f"{kind:7} {d:12} {r[1] / r[3] * 60:.1f} faux coups par minute")
         else:
             pr, rc = r[0] / max(r[1], 1), r[0] / max(r[2], 1)
             print(f"{kind:7} {d:12} précision {pr:.3f} rappel {rc:.3f} F1 {2 * pr * rc / max(pr + rc, 1e-9):.3f}")
+    if resume:
+        resume.unlink(missing_ok=True)
 
 
 def write_rust(model, nin, nx, path):
@@ -640,7 +657,11 @@ def main():
             print(f"{kind} {t:.3f}")
     elif mode in ("valider", "apprendre"):
         out = args.pop(0) if mode == "apprendre" else None
-        weights, tests, default = {}, [], 1.0
+        weights, tests, default, resume = {}, [], 1.0, None
+        if "--reprise" in args:
+            k = args.index("--reprise")
+            resume = pathlib.Path(args[k + 1])
+            del args[k : k + 2]
         for a in args:
             if a in ("--leger", "--essai"):
                 default = LIGHT if a == "--leger" else None
@@ -654,7 +675,7 @@ def main():
             weights[d] = (wk, float(ws) if ws else wk)
         data = load(list(dict.fromkeys(list(weights) + (tests if mode == "valider" else []))))
         if mode == "valider":
-            validate(data, weights, tests)
+            validate(data, weights, tests, resume)
         else:
             C = Corpus(data)
             model = train(C, {i: weights[t["dir"]] for i, t in enumerate(C.tracks)})

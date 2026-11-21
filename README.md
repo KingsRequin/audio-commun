@@ -131,15 +131,17 @@ remixages), F1 kick / F1 caisse claire :
 
 | | Réseaux sans contexte (0.3.0), mêmes références | Contexte par GRU (0.4.0) |
 |---|---|---|
-| 107 morceaux de l'utilisateur | 0,835 / 0,675 | **0,891 / 0,777** |
-| 93 morceaux variés | 0,789 / 0,703 | **0,878 / 0,800** |
-| MDB Drums | 0,638 / 0,393 | **0,787 / 0,561** |
-| Remixages d'essai | 0,723 / 0,522 | **0,895 / 0,712** |
-| Faux coups par minute, sons sans batterie | 5,9 / 13,4 | **2,3 / 0,7** |
+| 107 morceaux de l'utilisateur | 0,835 / 0,675 | **0,876 / 0,777** |
+| 93 morceaux variés | 0,789 / 0,703 | **0,872 / 0,802** |
+| MDB Drums | 0,638 / 0,393 | **0,751 / 0,592** |
+| Remixages d'essai | 0,723 / 0,522 | **0,902 / 0,714** |
+| Faux coups par minute, sons sans batterie | 5,9 / 13,4 | **2,5 / 0,7** |
 
-Cette validation date d'avant le dernier complément des données de synthèse (kicks longs, extraits sans
-caisse claire, ajoutés pour le test `kicks_seuls_ne_donnent_aucune_caisse_claire`), qui ne change pas les
-scores du banc Rust à 0,01 près ; elle n'a pas été refaite depuis (25 minutes de calcul).
+Colonne 0.4.0 : recette livrée, validation refaite le 2026-11-21. Le dernier complément des données de
+synthèse (kicks longs, extraits sans caisse claire, ajoutés pour le test
+`kicks_seuls_ne_donnent_aucune_caisse_claire`) a coûté au kick 0,015 sur les morceaux de l'utilisateur
+(0,891 avant lui) et 0,04 sur MDB (0,787), et rapporté 0,03 à la caisse claire sur MDB (0,561) ; le reste
+ne bouge pas à 0,01 près.
 
 Ce qui a compté (validation croisée) :
 
@@ -208,8 +210,9 @@ cargo run --release --example kick_mesures -- <morceau.f32>
 `perso` et `varie` sont les vrais morceaux (poids 1), `remix*` leurs remixages (0,5), `neg` les sons sans
 batterie (0,5) ; les données d'appoint (`--leger`, 0,25) apportent le rock acoustique (remixages de MDB) et
 la boîte à rythmes de synthèse, qui ne pèse que 0,1 pour la caisse claire (`@0.25/0.1`). Un apprentissage
-dure 5 minutes sur une carte graphique (RTX 4070), une validation croisée 25 ; il y faut plusieurs Go de
-mémoire vive et 4 Go de mémoire graphique : ne pas en lancer deux à la fois. Les mesures de `kick_modele.py`
+dure 5 minutes sur une carte graphique (RTX 4070), une validation croisée 15 à 25 ; il y faut plusieurs Go de
+mémoire vive et 4 Go de mémoire graphique : ne pas en lancer deux à la fois. Avec `--reprise <fichier>`,
+une validation interrompue puis relancée telle quelle reprend au groupe suivant. Les mesures de `kick_modele.py`
 (`levels`, `macro`, `prep`, `candidates`, `features`, `frame_inputs`, `decisions`) sont reproduites à
 l'identique dans `kick.rs` : les changer des deux côtés, puis réapprendre ; `detecter` et `kick_mesures`
 doivent donner les mêmes coups aux mêmes instants (vérifié sur 5 morceaux : aucun écart). Les niveaux par
