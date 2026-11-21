@@ -1,5 +1,5 @@
 //! Banc d'essai du kick sur de vrais morceaux annotés :
-//! `cargo run --release --example kick_bench -- <dossier> [sensibilité=5] [délai=0.1] [-v]`.
+//! `cargo run --release --example kick_bench -- <dossier> [sensibilité=5] [délai=0.1] [-v] [--detail <fichier.tsv>]`.
 //!
 //! Le dossier contient, pour chaque morceau, `<nom>.f32` (mono, f32 petit-boutiste, 48 kHz) et
 //! `<nom>.kicks` (un instant de kick en secondes par ligne, la référence). `scripts/kick_bench.py`
@@ -17,8 +17,12 @@
 //!
 //! Si `<nom>.caisses` existe (instants des vraies caisses claires), les caisses claires
 //! détectées sont jugées de même ; leur total est affiché à la fin.
+//!
+//! `--detail` écrit une ligne par morceau et par détecteur (trouvés, annoncés, attendus, durée), dans le
+//! format de `kick_modele.py valider --detail` : de quoi regrouper les résultats par style de musique.
 
 use audio_commun::kick::Analyzer;
+use std::io::Write;
 use std::path::Path;
 
 const SR: u32 = 48000;
@@ -112,11 +116,21 @@ fn median(v: &mut [f64]) -> f64 {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "-v");
-    let pos: Vec<&String> = args.iter().filter(|a| *a != "-v").collect();
+    let detail_at = args.iter().position(|a| a == "--detail");
+    let pos: Vec<&String> = args.iter().enumerate().filter(|&(i, a)| a != "-v" && detail_at.is_none_or(|d| i != d && i != d + 1)).map(|(_, a)| a).collect();
     let Some(dir) = pos.first() else {
-        eprintln!("usage : kick_bench <dossier> [sensibilité=5] [délai=0.1] [-v]");
+        eprintln!("usage : kick_bench <dossier> [sensibilité=5] [délai=0.1] [-v] [--detail <fichier.tsv>]");
         std::process::exit(2);
     };
+    let mut detail = match detail_at.and_then(|d| args.get(d + 1)) {
+        Some(path) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+            writeln!(f, "détecteur\tdossier\tmorceau\ttrouvés\tannoncés\tattendus\tdurée")?;
+            Some(f)
+        }
+        None => None,
+    };
+    let folder = Path::new(dir.as_str()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let sens: f32 = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let gap: f64 = pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.1);
 
@@ -141,11 +155,18 @@ fn main() -> std::io::Result<()> {
         let start = std::time::Instant::now();
         let (hits, snares) = detect(&samples, sens, gap);
         compute += start.elapsed().as_secs_f64();
-        seconds += samples.len() as f64 / SR as f64;
+        let duration = samples.len() as f64 / SR as f64;
+        seconds += duration;
+        let mut row = |kind: &str, s: &Score| match detail.as_mut() {
+            Some(f) => writeln!(f, "{kind}\t{folder}\t{name}\t{}\t{}\t{}\t{duration:.1}", s.tp, s.hits, s.refs),
+            None => Ok(()),
+        };
         let doubt = |ext: &str| read_times(&base.with_extension(ext)).unwrap_or_default();
         let mut s = score(&refs, &doubt("kicks_doute"), &hits);
+        row("kick", &s)?;
         if let Ok(snare_refs) = read_times(&base.with_extension("caisses")) {
             let mut c = score(&snare_refs, &doubt("caisses_doute"), &snares);
+            row("caisse", &c)?;
             snare_total.refs += c.refs;
             snare_total.hits += c.hits;
             snare_total.tp += c.tp;
