@@ -13,7 +13,7 @@ captures quasi identiques, deux analyses spectrales qui divergeaient).
 |---|---|---|---|
 | `capture` | `capture` | Loopback WASAPI de la sortie par défaut ou d'une sortie choisie, mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
 | `spectre` | `spectre` | FFT : bandes mel, graves/médiums/aigus, attaques kick/snare/hihat, tempo + PLL, intensité, drops, tonalité ; `spectre::start` = capture + analyse à cadence fixe | Prisme, Horizon |
-| `kick` | (toujours) | Grosse caisse et caisse claire à 15–30 ms de délai (biquads sur 10 bandes + petits réseaux appris, sans FFT), niveau et hauteur de la basse | Essaim |
+| `kick` | (toujours) | Grosse caisse et caisse claire à 15–30 ms de délai (biquads sur 10 bandes, un petit réseau récurrent pour le contexte et de petits réseaux de décision, appris, sans FFT), niveau et hauteur de la basse | Essaim |
 | `pulsation` | (toujours) | Tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans FFT ; relais pendant un passage sans kick | Essaim |
 
 Chaque application garde **sa propre capture** : faire passer l'analyse d'un processus à l'autre ajouterait
@@ -85,47 +85,111 @@ de chacune) : les tests de la bibliothèque ne remplacent pas un essai en musiqu
 ## Kick et caisse claire
 
 Détails de la méthode en tête de `src/kick.rs`. En résumé : 10 bandes fines (deux par bande large : sub,
-90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus), attaques candidates sur les pics de montée d'énergie des bandes
-larges, jugées 10, 20 et 30 ms après l'attaque par trois petits réseaux (32 neurones) pour le kick et trois
-pour la caisse claire (et les claps). Une attaque peut être les deux à la fois. La sensibilité règle le
-dernier seuil du kick ; sans kick depuis 4 s, le premier doit être franc. `Analyzer::kicks` et
+90–200 Hz, 200 Hz–1 kHz, 1–4 kHz, aigus) suivies tous les 5 ms, attaques candidates sur les pics de montée
+d'énergie des bandes larges, jugées 10, 20 et 30 ms après l'attaque par trois petits réseaux (32 neurones)
+pour le kick et trois pour la caisse claire (et les claps). Chaque réseau lit la forme de l'attaque **et le
+contexte** : l'état d'un petit réseau récurrent (GRU de 48) qui écoute les niveaux des bandes à chaque pas
+et retient ce qui précède (rythme, coups récents, nature du son : musique, voix seule, basse tenue). Une
+attaque peut être kick et caisse claire à la fois. La sensibilité règle le dernier seuil du kick ; sans kick
+depuis 4 s, le premier doit être franc ; après 2 s de silence, le contexte est oublié. `Analyzer::kicks` et
 `Analyzer::caisses` comptent les coups reconnus.
+
+Les bandes sous 4 kHz sont calculées sur le son sous-échantillonné (~12 kHz de 1 à 4 kHz, ~6 kHz en
+dessous, passe-bas d'ordre 6 avant chaque division) : mêmes niveaux, deux fois moins de filtrage.
 
 Pourquoi un modèle appris plutôt que des seuils : l'ancien détecteur de kick (énergie sous 90 Hz au-dessus
 de sa moyenne lente) était excellent sur la batterie acoustique, mais en musique électronique l'attaque du
 kick est dans les médiums et les aigus, et le sub n'arrive que 50 à 100 ms plus tard, en commençant même par
-se creuser (sidechain). Il y était en retard de 50 à 150 ms et confondait la basse et les voix graves (F1
-0,18 sur les morceaux de l'utilisateur). La caisse claire d'Essaim était, elle, un détecteur à seuils
-(bande à 2 kHz, enveloppes rapide et lente, tenue à 25 ms) : F1 0,36.
+se creuser (sidechain). Il y était en retard de 50 à 150 ms et confondait la basse et les voix graves.
+Pourquoi un contexte : en 30 ms, l'attaque d'une contrebasse, d'une voix grave ou d'un tom ressemble à un
+kick ; ce qui les distingue est ce qu'on a entendu avant.
 
-### Banc d'essai (mesuré le 2026-11-20)
+### Banc d'essai (mesuré le 2026-11-21)
 
 Coup compté juste s'il tombe entre 20 ms avant et 70 ms après un vrai coup ; F1 = moyenne (harmonique) de
-la précision et du rappel. F1 en validation croisée (5 groupes de morceaux, chaque morceau jugé par un
-modèle qui ne l'a pas appris) ; délai et faux kicks d'intro mesurés par `kick_bench` (Rust).
+la précision et du rappel. Références : annotations humaines pour MDB Drums ; instants exacts pour les
+remixages ; pour un morceau quelconque, le **consensus** de deux transcriptions ADTOF (voir « Données ») :
+un coup vu par les deux est sûr, un coup vu par une seule est douteux et ne compte ni juste ni faux. Ces
+références sont plus strictes que celles de la 0.3.0 (une seule transcription) : les chiffres d'alors
+(F1 0,81) ne se comparent pas à ceux-ci, d'où les deux colonnes remesurées.
 
-| | Avant (5 bandes, 16 neurones ; caisse claire à seuils) | Maintenant (10 bandes, 32 neurones) |
+Modèles livrés, mesurés par `kick_bench` (Rust) sur les mêmes fichiers (F1 kick / F1 caisse claire) :
+
+| | 0.3.0 (10 bandes, réseaux sans contexte) | 0.4.0 (contexte par GRU) |
 |---|---|---|
-| Kick, 107 morceaux de l'utilisateur (électro, dubstep, hardstyle, rap, pop, rock) | F1 0,807, délai médian 30 ms | **F1 0,811**, délai médian 30 ms |
-| Kick, MDB Drums (23 morceaux acoustiques, jazz compris) | F1 0,619, délai médian 20 ms | **F1 0,703**, délai médian 20 ms |
-| Faux kicks d'intro (avant le premier vrai kick, 107 morceaux) | 68 | 75 |
-| Caisse claire, 107 morceaux de l'utilisateur | F1 0,36 (précision 0,29), délai médian 32 ms | **F1 0,63** (précision 0,61), délai médian 30 ms |
-| Caisse claire, MDB Drums (notes fantômes comprises) | F1 0,28 | **F1 0,48** |
-| Calcul (un cœur) | 0,19 % | 0,35 % |
+| 107 morceaux de l'utilisateur (électro, dubstep, hardstyle, rap, pop, rock) | 0,87 / 0,74, délai médian 30 ms | **0,92 / 0,83**, délai médian 30 ms (caisse claire 20 ms) |
+| 93 morceaux variés (metal, jazz, funk, reggae, drum and bass, rap, techno, hardstyle, pop…) | 0,80 / 0,70 (jamais vus), délai 30 ms | **0,91 / 0,86**, délai 20 ms |
+| MDB Drums (23 morceaux acoustiques, annotations humaines) | 0,79 / 0,60, délai 20 ms | **0,86 / 0,75**, délai 20 ms |
+| 107 remixages à instants exacts, boîtes à rythmes jamais apprises | 0,76 / 0,54, délai 23 ms | **0,92 / 0,74**, délai 21 ms |
+| Faux coups par minute sur 59 sons sans batterie (voix, piano, orgue, cordes, contrebasse, ASMR ; 214 min) | 9,9 / 8,4 | **0,5 / 0,5** |
+| Faux kicks d'intro (avant le premier vrai kick, 107 morceaux) | 68 | 51 |
+| Calcul (un cœur, mesuré en alternance sur MDB) | 0,31 % | **0,26 %** |
 
-Ce qui a compté (validation croisée, F1 kick perso / MDB) : 32 neurones au lieu de 16 (0,807 → 0,814 /
-0,619 → 0,640), bandes fines (→ 0,812 / 0,674 à 16 neurones), les deux (0,813 / 0,695). Essayé sans gain
-net : plus d'époques ; le niveau des 200 ms d'avant l'attaque (+0,02 sur MDB, −0,005 en perso).
+Sauf les remixages d'essai, la 0.4.0 a appris sur ces morceaux. L'estimation honnête est la validation
+croisée (5 groupes de morceaux, chaque morceau jugé par un modèle qui ne l'a pas appris, ni lui ni ses
+remixages), F1 kick / F1 caisse claire :
 
-Références : MDB Drums (annotations humaines, <https://github.com/CarlSouthall/MDBDrums>) ; pour tout autre
-morceau, la batterie séparée par Demucs (`htdemucs`) puis transcrite par ADTOF
-(<https://github.com/xavriley/ADTOF-pytorch>), hors temps réel : F1 0,88 face aux annotations de MDB pour le
-kick. La caisse claire de référence vient de la même transcription (note 38).
+| | Réseaux sans contexte (0.3.0), mêmes références | Contexte par GRU (0.4.0) |
+|---|---|---|
+| 107 morceaux de l'utilisateur | 0,835 / 0,675 | **0,891 / 0,777** |
+| 93 morceaux variés | 0,789 / 0,703 | **0,878 / 0,800** |
+| MDB Drums | 0,638 / 0,393 | **0,787 / 0,561** |
+| Remixages d'essai | 0,723 / 0,522 | **0,895 / 0,712** |
+| Faux coups par minute, sons sans batterie | 5,9 / 13,4 | **2,3 / 0,7** |
+
+Cette validation date d'avant le dernier complément des données de synthèse (kicks longs, extraits sans
+caisse claire, ajoutés pour le test `kicks_seuls_ne_donnent_aucune_caisse_claire`), qui ne change pas les
+scores du banc Rust à 0,01 près ; elle n'a pas été refaite depuis (25 minutes de calcul).
+
+Ce qui a compté (validation croisée) :
+
+- le contexte (GRU) à lui seul, à données égales : kick +0,01 sur les morceaux de l'utilisateur, +0,05 sur
+  MDB, +0,10 sur les remixages d'essai ; caisse claire +0,04 à +0,07, et deux fois moins de fausses caisses
+  claires sur les sons sans batterie ;
+- les remixages à instants exacts et les sons sans batterie dans l'apprentissage : encore +0,05 sur les
+  remixages d'essai, faux coups sur les sons sans batterie divisés par 2 (kick) et 5 (caisse claire) ;
+- les références de consensus : les coups douteux n'apprennent plus rien de faux, et ne faussent plus la
+  mesure ;
+- un apprentissage dix fois plus long (40 → 400 passes) avec un GRU de 48 au lieu de 32 : kick +0,05,
+  caisse claire +0,06.
+
+Essayé sans gain : GRU de 64, réseaux de décision de 48, 800 passes, d'autres entrées pour le GRU, attendre
+50 ms au lieu de 30, une référence de kick par séparation de batterie pièce par pièce (DrumSep : pas
+meilleure que le consensus). Le banc de filtres sous-échantillonné donne les mêmes scores que le calcul à
+pleine cadence.
+
+Limites connues : le kick effleuré du jazz acoustique (bebop, cool jazz : presque aucun kick trouvé sur
+MDB), les notes fantômes de la batterie acoustique (rappel de la caisse claire 0,68 sur MDB), les caisses
+claires des boîtes à rythmes jamais entendues (0,74 sur les remixages d'essai), et un charleston fort
+frappé exactement avec un kick long (808), parfois compté comme caisse claire.
+
+### Données
+
+Hors du dépôt (droits des morceaux) ; tout se refait avec les scripts.
+
+- **Référence d'un morceau quelconque** (`kick_bench.py ref --demucs`) : ADTOF
+  (<https://github.com/xavriley/ADTOF-pytorch>) transcrit la batterie séparée par Demucs (`htdemucs`) et, à
+  part, le mélange complet. Vu par les deux : coup sûr (`.kicks`, `.caisses` ; précision 0,92 face aux
+  annotations de MDB). Vu par une seule : douteux (`.kicks_doute`, `.caisses_doute`), ignoré à
+  l'apprentissage comme à l'évaluation. `--pistes` garde les 4 pistes séparées pour les remixages.
+- **MDB Drums** (<https://github.com/CarlSouthall/MDBDrums>) : annotations humaines, et 4 remixages de
+  chaque morceau à partir de ses pistes (`kick_modele.py variantes`).
+- **Remixages à instants exacts** (`kick_remix.py`) : l'accompagnement réel d'un morceau (basse + voix +
+  reste, sans la batterie) reçoit une batterie refaite avec des sons isolés (boîtes à rythmes de
+  <https://github.com/geikha/tidal-drum-machines>, banque <https://github.com/tidalcycles/Dirt-Samples>,
+  kicks de synthèse) posés aux instants de la batterie d'origine. Deux versions par morceau, plus une sans
+  batterie du tout (aucun coup). Dix boîtes à rythmes sont tenues à l'écart pour l'évaluation (`--essai`).
+- **Sons sans batterie** : voix parlée et chantée, piano, orgue, cordes, guitare, contrebasse, didgeridoo,
+  ASMR, nappes (fichiers `.kicks` et `.caisses` vides) : tout coup y est faux.
+- **Boîte à rythmes de synthèse** (`kick_modele.py synth`) : les cas que la vraie musique montre peu ou
+  étiquette mal : kick de sinus pur, kick long qui ondule (808), caisses claires seules, roulements de
+  montée sans kick, extraits sans aucune caisse claire.
 
 ```
-python scripts/kick_bench.py mdb <MDB Drums> <données>/mdb                     # annotations humaines
-python scripts/kick_bench.py ref <données>/perso --demucs <dossier de musique>  # référence ADTOF (GPU)
-python scripts/kick_bench.py caisses <données>/perso --demucs                   # `.caisses` des morceaux déjà préparés
+python scripts/kick_bench.py mdb <MDB Drums> <données>/mdb                               # annotations humaines
+python scripts/kick_bench.py ref <données>/perso --demucs --pistes <pistes>/perso <dossier de musique>   # consensus ADTOF (GPU)
+python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remix     # + <données>/remixsb (sans batterie)
+python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixtest 1 --essai
 cargo run --release --example kick_bench -- <données>/perso [sensibilité] [délai] [-v]
 ```
 
@@ -133,47 +197,46 @@ cargo run --release --example kick_bench -- <données>/perso [sensibilité] [dé
 
 ```
 python scripts/kick_modele.py variantes <MDB Drums> <données>/mdbaug   # remixages de MDB
-python scripts/kick_modele.py synth <données>/synth 200                # boîte à rythmes, étiquettes exactes
-python scripts/kick_modele.py valider <données>/perso <données>/mdb --leger <données>/mdbaug <données>/synth@0.25/0.1
-python scripts/kick_modele.py apprendre src/kick_modele.rs <données>/perso <données>/mdb --leger <données>/mdbaug <données>/synth@0.25/0.1
+python scripts/kick_modele.py synth <données>/synth 300                # boîte à rythmes, étiquettes exactes
+cd <données>
+python <dépôt>/scripts/kick_modele.py valider perso varie mdb remix@.5 remixv@.5 remixsb@.5 remixvsb@.5 neg@.5 --leger mdbaug synth@0.25/0.1 --essai remixtest neg
+python <dépôt>/scripts/kick_modele.py apprendre <dépôt>/src/kick_modele.rs perso varie mdb remix@.5 remixv@.5 remixsb@.5 remixvsb@.5 neg@.5 --leger mdbaug synth@0.25/0.1
+python <dépôt>/scripts/kick_modele.py detecter <dépôt>/src/kick_modele.rs <morceau.f32>   # doit donner les coups de :
+cargo run --release --example kick_mesures -- <morceau.f32>
 ```
 
-Les données d'appoint (`--leger`, un quart du poids d'un morceau) apportent du rock acoustique (remixages
-de MDB) et les cas que la vraie musique montre peu : kick de sinus pur (808), caisses claires seules,
-roulements de montée sans kick. Pour la caisse claire, la boîte à rythmes ne pèse que 0,1 (`@0.25/0.1`) :
-à 0,25, sa précision sur la vraie musique baissait (F1 0,645 → 0,621) ; sans elle, une caisse claire de
-boîte à rythmes toute simple n'était plus reconnue. Les mesures de `kick_modele.py` (`levels`, `macro`,
-`prep`, `features`) sont reproduites à l'identique dans `kick.rs` : les changer des deux côtés, puis
-réapprendre. Environnement utilisé : Python 3.11, torch 2.6 (CUDA), demucs, adtof-pytorch, scipy ; ffmpeg.
+`perso` et `varie` sont les vrais morceaux (poids 1), `remix*` leurs remixages (0,5), `neg` les sons sans
+batterie (0,5) ; les données d'appoint (`--leger`, 0,25) apportent le rock acoustique (remixages de MDB) et
+la boîte à rythmes de synthèse, qui ne pèse que 0,1 pour la caisse claire (`@0.25/0.1`). Un apprentissage
+dure 5 minutes sur une carte graphique (RTX 4070), une validation croisée 25 ; il y faut plusieurs Go de
+mémoire vive et 4 Go de mémoire graphique : ne pas en lancer deux à la fois. Les mesures de `kick_modele.py`
+(`levels`, `macro`, `prep`, `candidates`, `features`, `frame_inputs`, `decisions`) sont reproduites à
+l'identique dans `kick.rs` : les changer des deux côtés, puis réapprendre ; `detecter` et `kick_mesures`
+doivent donner les mêmes coups aux mêmes instants (vérifié sur 5 morceaux : aucun écart). Les niveaux par
+bande sont gardés dans `<dossier>/.mesures/` (à effacer si `levels` change). Environnement utilisé :
+Python 3.11, torch 2.6 (CUDA), demucs, adtof-pytorch, scipy, soundfile ; ffmpeg.
 
-### Pistes suivantes (non faites, notées le 2026-11-20)
+### Pistes suivantes (non faites, notées le 2026-11-21)
 
-Par ordre de gain attendu. Chacune se juge comme les précédentes : `kick_modele.py valider` (validation
-croisée, F1 kick et caisse claire, perso et MDB), puis tests synthétiques et `kick_bench`, chiffres ici.
+Par ordre de gain attendu. Chacune se juge comme les précédentes : `kick_modele.py valider`, puis tests
+synthétiques et `kick_bench`, chiffres ici.
 
-1. **Moins de faux kicks sur la basse et les voix.** Faire garder par Demucs les pistes `bass` et `vocals`
-   (aujourd'hui seule `drums` sert, puis est jetée) et en tirer des exemples négatifs : attaques candidates
-   où la basse ou la voix montent sans kick dans la référence, ou remixages « morceau sans batterie »
-   (bass + vocals + other) dont toutes les attaques sont des non-kicks. À peser comme les données d'appoint
-   (`--leger`). Cible : précision du kick, et les faux kicks d'intro (75 sur 107 morceaux).
-2. **Astuces d'entraînement de Weber et al. (2024)** : élargir la cible (les candidats voisins d'un vrai
-   coup comptent comme positifs à poids réduit), pondérer les classes (kick, caisse claire, rien), et
-   compléter les données par changements de hauteur et de tempo. Rien à changer côté Rust si les mesures
-   restent les mêmes.
-3. **Notes fantômes et batterie acoustique** : sur MDB, 34 % seulement des caisses claires sont trouvées
-   (rappel), surtout les coups légers du jazz. Piste : un seuil de caisse claire relatif au niveau des
-   caisses récentes, ou un attribut « niveau de l'attaque par rapport aux 2 s d'avant ».
-4. **Démarrage** : à 90 BPM, le test d'Essaim `tempo_trouve_sur_des_kicks_reguliers` montre que les 2
-   premiers kicks d'un flux sont manqués (l'ancien modèle les trouvait), à cause de la règle « sans kick
-   depuis 4 s, le premier doit être franc ». Mesurer avec `kick_bench` ce que coûterait un relèvement plus
-   court ou plus doux.
-5. **Tempo (`pulsation`)** sur l'activité continue de la batterie (sortie des réseaux à chaque attaque, ou
-   flux spectral) plutôt que sur les seuls instants des kicks, à la manière de BeatNet+ (Heydari 2024,
-   filtre particulaire en ligne) : plus robuste quand le kick manque (breaks, rap sans kick régulier).
-6. **Essai en vrai** non lancé pour la 0.3.0 : `cargo test --release -- --ignored musique_reelle` dans
-   Essaim, un morceau en lecture.
+1. **Caisse claire des boîtes à rythmes et notes fantômes** : c'est le score le plus bas (0,74 sur les
+   remixages d'essai, rappel 0,68 sur MDB). Pistes : plus de kits dans les remixages, changements de hauteur
+   et de tempo des sons isolés, cible élargie aux candidats voisins d'un vrai coup.
+2. **Toms et charleston** : ADTOF les transcrit aussi (notes 47 et 42) ; un détecteur de plus coûterait
+   trois petits réseaux, le contexte étant déjà calculé.
+3. **Démarrage** : à 90 BPM, le test d'Essaim `tempo_trouve_sur_des_kicks_reguliers` montre que les 2
+   premiers kicks d'un flux sont manqués, à cause de la règle « sans kick depuis 4 s, le premier doit être
+   franc ». Mesurer ce que coûterait un relèvement plus court ou plus doux en faux kicks d'intro (51 sur
+   107 morceaux aujourd'hui).
+4. **Tempo (`pulsation`)** sur l'activité continue de la batterie (sortie des réseaux à chaque attaque)
+   plutôt que sur les seuls instants des kicks, à la manière de BeatNet+ (Heydari 2024, filtre particulaire
+   en ligne) : plus robuste quand le kick manque (breaks, rap sans kick régulier).
+5. **Niveau et hauteur de la basse** : inchangés depuis la 0.2.0, faute de référence objective. La piste
+   `bass` de Demucs (gardée par `--pistes`) en fournirait une : niveau de la basse seule, hauteur par pYIN
+   hors ligne.
 
-Pour reprendre : les données sont prêtes (`.f32`, `.kicks`, `.caisses` des 107 morceaux, MDB et ses
-remixages, boîte à rythmes) ; seules les pistes séparées par Demucs ont été effacées (piste 1 : relancer
-`kick_bench.py ref --demucs` en les gardant). Lectures : Böck et Widmer 2013 (détection d'attaques en ligne),
-Vogl et al. 2017 (transcription de batterie), Weber et al. 2024, Heydari et al. 2024 (BeatNet+), ADTOF.
+Lectures : Böck et Widmer 2013 (détection d'attaques en ligne), Vogl et al. 2017 (transcription de
+batterie), Zehren et al. (ADTOF), Weber et al. (STAR Drums : batterie refaite sur accompagnement réel ;
+astuces d'entraînement de 2024), Heydari et al. 2024 (BeatNet+).

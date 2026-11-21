@@ -12,6 +12,8 @@ README. Consignes propres à un poste : `CLAUDE.local.md` (non suivi).
   trouvées seules et avec les kicks, aucune sur des kicks seuls) **et** banc sur
   vraie musique (`--example kick_bench`, données hors du dépôt). Tout
   changement de mesure ou de seuil : passer les deux, et noter les chiffres du banc dans le README. Les poids
-  `src/kick_modele.rs` sont générés (`scripts/kick_modele.py apprendre`), jamais modifiés à la main.
+  `src/kick_modele.rs` sont générés (`scripts/kick_modele.py apprendre`), jamais modifiés à la main. Le script
+  refait les mesures de `kick.rs` : après un changement, `kick_modele.py detecter` et `--example kick_mesures`
+  doivent donner les mêmes coups. Un seul apprentissage à la fois (mémoire).
 - `spectre` est réglé pour les LED de Prisme : ne pas changer son comportement sans relancer sa sonde
   (`--example audio_probe -- 15` dans Prisme).
