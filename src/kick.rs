@@ -94,8 +94,12 @@ const MID_WIN: usize = 25;
 const START_PEAK: [f64; 5] = [-8.0, -11.0, -12.0, -16.0, -18.0];
 const START_FLUX_PK: f64 = 35.0;
 const START_SUB_EXC_PK: f64 = 0.015;
-/// En dessous (dB, toutes bandes), c'est le silence.
+/// Seuil de silence (dB, toutes bandes) à volume normal. Il suit le volume d'écoute : `SILENCE_BELOW` dB
+/// sous le plus fort pic récent, sans monter au-dessus de `SILENCE_DB` ni descendre sous `SILENCE_MIN`.
+/// Sous `SILENCE_MIN`, rien ne joue : les pics ne retombent plus.
 const SILENCE_DB: f64 = -60.0;
+const SILENCE_BELOW: f64 = 52.0;
+const SILENCE_MIN: f64 = -100.0;
 /// Durée de silence (s) après laquelle le contexte est oublié.
 const RESET_S: f64 = 2.0;
 
@@ -229,6 +233,8 @@ struct Frame {
     peak: [f64; 5],
     /// Niveau toutes bandes (dB).
     tot: f64,
+    /// Seuil de silence à ce pas (dB).
+    floor: f64,
     /// Excès du sub sur sa moyenne lente, rapporté à son pic récent (0..1).
     sub_onset: f64,
     /// Sub par rapport au pic récent des médiums (dB).
@@ -541,13 +547,16 @@ impl Analyzer {
         }
         let lin = f.l.map(|v| 10f64.powf(v / 10.0));
         f.tot = 10.0 * lin.iter().sum::<f64>().log10();
-        // Les références du morceau ne retombent pas pendant un silence : après une pause, le
-        // morceau suivant est jugé par rapport au précédent, pas par rapport au silence.
-        let decay = f.tot >= SILENCE_DB;
+        // Silence : loin sous le pic récent, donc relatif au volume d'écoute. Les références du morceau
+        // ne retombent pas quand rien ne joue : après une pause, le morceau suivant est jugé par rapport
+        // au précédent. Elles retombent dès que quelque chose joue, même très bas : un volume baissé de
+        // 40 dB est rattrapé en 20 s.
+        f.floor = (self.peak.iter().copied().fold(f64::MIN, f64::max) - SILENCE_BELOW).clamp(SILENCE_MIN, SILENCE_DB);
+        let decay = f.tot >= f.floor;
         self.flux_pk = f.flux.max(if decay { self.flux_pk * (-dt / 2.0).exp() } else { self.flux_pk });
         f.flux_pk = self.flux_pk;
         for b in 0..5 {
-            self.peak[b] = f.l[b].max(if decay { self.peak[b] - 2.0 * dt } else { self.peak[b] });
+            self.peak[b] = f.l[b].max(if f.tot >= SILENCE_MIN { self.peak[b] - 2.0 * dt } else { self.peak[b] });
         }
         f.peak = self.peak;
         // excès du sub sur sa moyenne lente (350 ms), rapporté à son pic récent (3 s)
@@ -581,7 +590,7 @@ impl Analyzer {
         if i > PRE + 1 {
             let p = i - 1;
             let (a, prev) = (self.frame(p), self.frame(p - 1));
-            if a.flux > prev.flux && a.flux >= f.flux && a.flux >= 0.15 * prev.flux_pk && a.tot > -70.0 {
+            if a.flux > prev.flux && a.flux >= f.flux && a.flux >= 0.15 * prev.flux_pk && a.tot > a.floor - 10.0 {
                 self.kick.pending.push(Pending { hop: p, stage: 0 });
                 self.snare.pending.push(Pending { hop: p, stage: 0 });
             }
@@ -907,6 +916,25 @@ mod tests {
                 let median = delays[delays.len() / 2];
                 assert!(median < 0.03, "basse {bass}, sens {sens} : délai médian {:.0} ms", median * 1000.0);
             }
+        }
+    }
+
+    /// Le même morceau joué 40 dB plus bas (volume d'écoute presque coupé) donne les mêmes coups, une
+    /// fois les références du niveau retombées (20 s : le morceau est joué quatre fois, la dernière
+    /// est jugée).
+    #[test]
+    fn coups_trouves_a_volume_tres_bas() {
+        let once = render(190.0, true);
+        let start = 3.0 * 8.0;
+        for gain in [1.0f32, 0.01] {
+            let sig: Vec<f32> = once.iter().cycle().take(once.len() * 4).map(|v| v * gain).collect();
+            let kicks: Vec<f64> = kick_times(&sig, 5.0).into_iter().filter(|&t| t >= start).map(|t| t - start).collect();
+            let found = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5].iter().filter(|&&k| kicks.iter().any(|&h| h >= k && h < k + 0.1)).count();
+            assert!(found >= 7, "gain {gain} : {found}/8 kicks ({kicks:?})");
+            assert!(kicks.len() <= found + 1, "gain {gain} : kicks en trop ({kicks:?})");
+            let snares: Vec<f64> = times(&sig, 5.0, |a| a.caisses).into_iter().filter(|&t| t >= start).map(|t| t - start).collect();
+            let found = (0..8).filter(|&k| snares.iter().any(|&h| h >= k as f64 + 0.5 && h < k as f64 + 0.56)).count();
+            assert!(found >= 7, "gain {gain} : {found}/8 caisses claires ({snares:?})");
         }
     }
 

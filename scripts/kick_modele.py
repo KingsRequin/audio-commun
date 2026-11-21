@@ -9,7 +9,7 @@ par ce script :
 
     python kick_modele.py synth <sortie> [n=300]           boîte à rythmes synthétique, étiquettes exactes
     python kick_modele.py variantes <dossier MDB> <sortie>  4 remixages de chaque morceau de MDB (pistes séparées)
-    python kick_modele.py valider <dossier>... [--leger <dossier>...] [--essai <dossier>...] [--reprise <fichier>]
+    python kick_modele.py valider <dossier>... [--leger <dossier>...] [--essai <dossier>...] [--reprise <fichier>] [--detail <fichier.tsv>]
     python kick_modele.py apprendre <kick_modele.rs> <dossier>... [--leger <dossier>...]
     python kick_modele.py detecter <kick_modele.rs> <morceau.f32>   coups trouvés par le modèle écrit (calcul en Python)
 
@@ -22,7 +22,8 @@ dossier d'apprentissage d'un autre poids répété après `--essai` (`neg@.5 ...
 de même, chaque morceau par le modèle qui ne l'a pas appris. Un dossier sans aucun coup de référence
 (voix, musique sans batterie) est noté en faux coups par minute. Avec `--reprise <fichier>`, chaque
 groupe fini (5 minutes) y est noté : relancée avec les mêmes arguments, une validation interrompue
-reprend au groupe suivant ; le fichier est effacé à la fin.
+reprend au groupe suivant ; le fichier est effacé à la fin. `--detail <fichier.tsv>` écrit le résultat de
+chaque morceau (coups trouvés, annoncés, attendus), pour juger par style de musique.
 
 Modèle : un petit réseau récurrent (GRU) lit à chaque pas de 5 ms les niveaux des 10 bandes et garde
 le contexte (rythme, coups récents, nature du son) ; chaque attaque candidate est jugée 10, 20 et
@@ -39,6 +40,7 @@ change). Dépendances : numpy, scipy, torch (GPU conseillé) ; ffmpeg pour `vari
 
 import ast
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -64,7 +66,9 @@ PRE = 8
 P0 = [-8.0, -11.0, -12.0, -16.0, -18.0]  # références de départ (= START_PEAK en Rust)
 FPK0 = 35.0
 SUBPK0 = 0.015
-SILENCE_DB = -60.0
+SILENCE_DB = -60.0  # seuil de silence (dB, toutes bandes) à volume normal…
+SILENCE_BELOW = 52.0  # … en fait 52 dB sous le plus fort pic récent : il suit le volume d'écoute…
+SILENCE_MIN = -100.0  # … jusqu'à ce plancher, sous lequel rien ne joue (les pics ne retombent plus)
 H = 32  # couche cachée des réseaux de décision
 G = 48  # taille du GRU
 EPOCHS, STEPS, BATCH, SEG = 400, 24, 48, 3000  # apprentissage : 400 × 24 lots de 48 extraits de 15 s (au-delà, plus de gain)
@@ -131,17 +135,19 @@ def prep(L):
     d[:, 2:] = np.maximum(L[:, 2:] - L[:, :-2], 0)
     F = d.sum(0)
     tot = 10 * np.log10((10 ** (L / 10)).sum(0))
-    silent = tot < SILENCE_DB
-    Fpk = np.empty(n)
+    Fpk, floor = np.empty(n), np.empty(n)
     P = np.empty_like(L)
     cur, c = FPK0, np.array(P0)
     a = np.exp(-HOP / 2.0)
     for i in range(n):
-        if not silent[i]:
-            cur = max(F[i], cur * a)
-            c = np.maximum(L[:, i], c - HOP * 2.0)
+        # Silence : loin sous le pic récent, donc relatif au volume d'écoute. Les pics des bandes retombent
+        # tant que quelque chose joue, même très bas : un volume baissé de 40 dB est rattrapé en 20 s.
+        floor[i] = min(max(c.max() - SILENCE_BELOW, SILENCE_MIN), SILENCE_DB)
+        cur = max(F[i], cur * a if tot[i] >= floor[i] else cur)
+        c = np.maximum(L[:, i], c - HOP * 2.0 if tot[i] >= SILENCE_MIN else c)
         Fpk[i] = cur
         P[:, i] = c
+    silent = tot < floor
     e = 10 ** (L[0] / 10)
     mid = 10 ** (L[1] / 10) + 10 ** (L[2] / 10)
     slow, pk = 0.0, SUBPK0
@@ -153,12 +159,12 @@ def prep(L):
         pk = max(exc, pk if silent[i] else pk * a2)
         O[i] = exc / pk
         Gm[i] = 10 * np.log10(e[i] / (mid[max(0, i - 24) : i + 1].max() + 1e-12) + 1e-9)
-    return F, Fpk, P, tot, O, Gm
+    return F, Fpk, P, tot, O, Gm, floor
 
 
-def candidates(F, Fpk, tot):
+def candidates(F, Fpk, tot, floor):
     p = np.arange(PRE + 1, len(F) - max(STAGES) - 1)
-    m = (F[p] > F[p - 1]) & (F[p] >= F[p + 1]) & (F[p] >= 0.15 * Fpk[p - 1]) & (tot[p] > -70)
+    m = (F[p] > F[p - 1]) & (F[p] >= F[p + 1]) & (F[p] >= 0.15 * Fpk[p - 1]) & (tot[p] > floor[p] - 10)
     return p[m]
 
 
@@ -204,10 +210,12 @@ def track(base):
     else:
         Lf = levels(np.fromfile(str(base) + ".f32", dtype="<f4"))
         cache.parent.mkdir(exist_ok=True)
-        np.save(cache, Lf.astype(np.float32))
+        tmp = cache.with_name(f"{cache.stem}.{os.getpid()}.tmp.npy")  # un calcul coupé ne laisse pas de cache tronqué
+        np.save(tmp, Lf.astype(np.float32))
+        os.replace(tmp, cache)
     L = macro(Lf)
-    F, Fpk, P, tot, O, Gm = prep(L)
-    p = candidates(F, Fpk, tot)
+    F, Fpk, P, tot, O, Gm, floor = prep(L)
+    p = candidates(F, Fpk, tot, floor)
     t = p * HOP
     near = lambda r: np.array([np.any(np.abs(r - x) <= TOL) for x in t], dtype=bool) if len(r) else np.zeros(len(t), bool)
     ref, y, mask, doubt = {}, {}, {}, {}
@@ -217,7 +225,9 @@ def track(base):
             u = times(pathlib.Path(str(base) + suffix + "_doute"))
             ref[kind], y[kind], doubt[kind] = r, near(r), u if u is not None else np.array([])
             mask[kind] = ~near(doubt[kind]) | y[kind]
-    return dict(name=base.name, n=Lf.shape[1], fin=frame_inputs(Lf, P, O, Gm), p=p, X=[features(Lf, L, F, Fpk, P, tot, O, Gm, p, s) for s in STAGES], y=y, mask=mask, ref=ref, doubt=doubt)
+    half = lambda a: a.astype(np.float16)  # demi-précision : les mesures de 3 000 morceaux pèsent des Go
+    X = [half(features(Lf, L, F, Fpk, P, tot, O, Gm, p, s)) for s in STAGES]
+    return dict(name=base.name, n=Lf.shape[1], fin=half(frame_inputs(Lf, P, O, Gm)), p=p, X=X, y=y, mask=mask, ref=ref, doubt=doubt)
 
 
 def load(dirs):
@@ -234,15 +244,16 @@ def load(dirs):
 
 
 class Corpus:
-    """Tous les morceaux bout à bout sur le GPU. Les mesures y sont gardées en demi-précision
-    (f16, converties à l'usage) et retirées de `data` au fur et à mesure : elles pèsent plusieurs Go."""
+    """Tous les morceaux bout à bout. Les mesures (plusieurs Go, en demi-précision) restent en mémoire
+    vive : seuls les lots partent sur le GPU, dont la mémoire ne limite donc pas la taille des données.
+    Elles sont retirées de `data` au fur et à mesure."""
 
     def __init__(self, data):
         import torch
 
         self.dev = dev = "cuda" if torch.cuda.is_available() else "cpu"
         ts = [(d, t) for d, group in data.items() for t in group]
-        half = lambda arrays: torch.tensor(np.concatenate(arrays).astype(np.float16), device=dev)
+        half = lambda arrays: torch.from_numpy(np.concatenate(arrays))
         self.fin = half([t.pop("fin") for _, t in ts])
         self.cx = []
         for si in range(len(STAGES)):
@@ -309,10 +320,10 @@ def train(C, weights, seed=0):
     wtab[torch.tensor(ids, device=dev), 1] = torch.tensor(ws / wk, dtype=torch.float32, device=dev)
     ctab = torch.tensor(C.ct, device=dev)
     sub = np.flatnonzero(np.isin(C.ct, ids))
-    sub = torch.tensor(sub[np.random.default_rng(0).permutation(len(sub))[:400000]], device=dev)
+    sub = np.sort(sub[np.random.default_rng(0).permutation(len(sub))[:400000]])
     norm = []
     for x in C.cx:  # plage et normalisation des mesures, d'après les morceaux d'apprentissage
-        X = x[sub].float().cpu().numpy()
+        X = x[sub].float().numpy()
         lo, hi = np.percentile(X, 0.1, axis=0), np.percentile(X, 99.9, axis=0)
         X = np.clip(X, lo, hi)
         norm.append((lo, hi, X.mean(0), X.std(0) + 1e-6))
@@ -321,20 +332,22 @@ def train(C, weights, seed=0):
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 4e-3, total_steps=EPOCHS * STEPS)
     off, ns = np.array([C.tracks[i]["off"] for i in ids]), np.array([C.tracks[i]["n"] for i in ids])
     prob = wk / wk.sum()  # chaque morceau pèse son poids, quelle que soit sa longueur
-    ar = torch.arange(SEG, device=dev)
+    ar = np.arange(SEG)
+    gpu = lambda a: torch.from_numpy(a).to(dev)
     for _ in range(EPOCHS * STEPS):
         j = rng.choice(len(ids), BATCH, p=prob)
         a = (rng.random(BATCH) * np.maximum(1, ns[j] - SEG)).astype(np.int64)
         g0, g1 = off[j] + a, off[j] + np.minimum(a + SEG, ns[j])
-        idx = torch.minimum(torch.tensor(g0, device=dev)[:, None] + ar[None, :], torch.tensor(g1 - 1, device=dev)[:, None])
-        h = model.states(C.fin[idx].float())
+        idx = np.minimum(g0[:, None] + ar[None, :], (g1 - 1)[:, None])
+        h = model.states(C.fin[idx].to(dev).float())
         lo, hi = np.searchsorted(C.cp_np, g0 + PRE + 1), np.searchsorted(C.cp_np, g1 - STAGES[-1] - 1)
-        ci = torch.cat([torch.arange(l, max(l, u), device=dev) for l, u in zip(lo, hi)])
-        bi = torch.cat([torch.full((max(0, u - l),), b, device=dev) for b, (l, u) in enumerate(zip(lo, hi))])
-        q = C.cp[ci] - torch.tensor(g0, device=dev)[bi]
-        w, y, loss = C.cm[ci] * wtab[ctab[ci]], C.cy[ci], 0
+        ci = np.concatenate([np.arange(l, max(l, u)) for l, u in zip(lo, hi)])
+        bi = gpu(np.concatenate([np.full(max(0, u - l), b) for b, (l, u) in enumerate(zip(lo, hi))]))
+        cg = gpu(ci)
+        q = C.cp[cg] - gpu(g0)[bi]
+        w, y, loss = C.cm[cg] * wtab[ctab[cg]], C.cy[cg], 0
         for si, s in enumerate(STAGES):
-            l = torch.nn.functional.binary_cross_entropy_with_logits(model.out(si, h[bi, q + s], C.cx[si][ci].float()), y, reduction="none")
+            l = torch.nn.functional.binary_cross_entropy_with_logits(model.out(si, h[bi, q + s], C.cx[si][ci].to(dev).float()), y, reduction="none")
             loss = loss + (l * w).sum() / w.sum().clamp(min=1)
         opt.zero_grad()
         loss.backward()
@@ -350,10 +363,10 @@ def predict(model, C, i):
 
     t = C.tracks[i]
     with torch.no_grad():
-        h = model.states(C.fin[t["off"] : t["off"] + t["n"]][None].float())[0]
+        h = model.states(C.fin[t["off"] : t["off"] + t["n"]][None].to(C.dev).float())[0]
         p = torch.tensor(t["p"], device=C.dev)
         ci = slice(t["c0"], t["c0"] + len(t["p"]))
-        return torch.stack([model.out(si, h[p + s], C.cx[si][ci].float()) for si, s in enumerate(STAGES)], 1).cpu().numpy()
+        return torch.stack([model.out(si, h[p + s], C.cx[si][ci].to(C.dev).float()) for si, s in enumerate(STAGES)], 1).cpu().numpy()
 
 
 def decisions(p, scores, kind):
@@ -395,24 +408,26 @@ def base_name(n):
     return re.sub(r"_v\d$", "", n)
 
 
-def validate(data, weights, tests, resume=None):
+def validate(data, weights, tests, resume=None, detail=None):
     """weights : {dossier: (poids kick, poids caisse)} des dossiers d'apprentissage ; un dossier est
     évalué s'il pèse 1 (vrai morceau) ou s'il est dans `tests`. `resume` : fichier où sont notés les
     groupes finis, pour qu'une validation interrompue reprenne au groupe suivant (les groupes sont
-    indépendants : chaque apprentissage repart de la même graine)."""
+    indépendants : chaque apprentissage repart de la même graine). `detail` : fichier TSV qui reçoit une
+    ligne par morceau et par détecteur (trouvés, annoncés, attendus, durée en secondes)."""
     C = Corpus(data)
     evald = [d for d in data if d in tests or weights.get(d, (0,))[0] == 1]
     names = sorted({base_name(t["name"]) for t in C.tracks if t["dir"] in evald})
     fold = dict(zip(names, np.random.default_rng(0).permutation(len(names)) % 5))
     group = lambda t: fold.get(base_name(t["name"]), -1)
     sig = repr((sorted(weights.items()), sorted(tests), len(C.tracks)))
-    state = {"sig": sig, "done": 0, "tot": {}}
+    state = {"sig": sig, "done": 0, "tot": {}, "rows": []}
     if resume and resume.exists():
         old = json.loads(resume.read_text(encoding="utf-8"))
         if old["sig"] == sig:
             state = old
             print(f"reprise après le groupe {state['done']}/5", flush=True)
     tot = {tuple(k.split("|")): np.array(v) for k, v in state["tot"].items()}
+    rows = state["rows"]
     for f in range(state["done"], 5):
         model = train(C, {i: weights[t["dir"]] for i, t in enumerate(C.tracks) if t["dir"] in weights and group(t) != f})
         for i, t in enumerate(C.tracks):
@@ -421,11 +436,12 @@ def validate(data, weights, tests, resume=None):
                 for ki, kind in enumerate(KINDS):
                     if kind in t["ref"]:
                         key = (kind, pathlib.Path(t["dir"]).name)
-                        tot.setdefault(key, np.zeros(4))
-                        tot[key] += [*simulate(t["p"], o[:, :, ki], t["ref"][kind], kind, t["doubt"][kind]), t["n"] * HOP]
+                        r = [*simulate(t["p"], o[:, :, ki], t["ref"][kind], kind, t["doubt"][kind]), t["n"] * HOP]
+                        tot[key] = tot.get(key, np.zeros(4)) + r
+                        rows.append([*key, t["name"], *(float(v) for v in r)])
         print(f"groupe {f + 1}/5", flush=True)
         if resume:
-            state = {"sig": sig, "done": f + 1, "tot": {"|".join(k): v.tolist() for k, v in tot.items()}}
+            state = {"sig": sig, "done": f + 1, "tot": {"|".join(k): v.tolist() for k, v in tot.items()}, "rows": rows}
             resume.write_text(json.dumps(state), encoding="utf-8")
     for (kind, d), r in sorted(tot.items()):
         if r[2] == 0:
@@ -433,6 +449,10 @@ def validate(data, weights, tests, resume=None):
         else:
             pr, rc = r[0] / max(r[1], 1), r[0] / max(r[2], 1)
             print(f"{kind:7} {d:12} précision {pr:.3f} rappel {rc:.3f} F1 {2 * pr * rc / max(pr + rc, 1e-9):.3f}")
+    if detail:
+        head = ["détecteur", "dossier", "morceau", "trouvés", "annoncés", "attendus", "durée"]
+        body = [[k, d, n, f"{tp:.0f}", f"{det:.0f}", f"{ref:.0f}", f"{dur:.1f}"] for k, d, n, tp, det, ref, dur in sorted(rows)]
+        detail.write_text("".join("\t".join(r) + "\n" for r in [head, *body]), encoding="utf-8")
     if resume:
         resume.unlink(missing_ok=True)
 
@@ -490,13 +510,13 @@ def detect(model_path, f32_path):
     m = read_rust(model_path)
     Lf = levels(np.fromfile(f32_path, dtype="<f4"))
     L = macro(Lf)
-    F, Fpk, P, tot, O, Gm = prep(L)
-    p = candidates(F, Fpk, tot)
+    F, Fpk, P, tot, O, Gm, floor = prep(L)
+    p = candidates(F, Fpk, tot, floor)
     fin = frame_inputs(Lf, P, O, Gm)
     g, sig = m["GRU"], lambda v: 1 / (1 + np.exp(-v))
     h, states, silent = np.zeros(G), np.empty((len(fin), G)), 0
     for i, x in enumerate(fin):
-        silent = silent + 1 if tot[i] < SILENCE_DB else 0
+        silent = silent + 1 if tot[i] < floor[i] else 0
         if silent * HOP >= 2.0:  # RESET_S en Rust : contexte oublié après 2 s de silence
             h = np.zeros(G)
         else:
@@ -657,11 +677,12 @@ def main():
             print(f"{kind} {t:.3f}")
     elif mode in ("valider", "apprendre"):
         out = args.pop(0) if mode == "apprendre" else None
-        weights, tests, default, resume = {}, [], 1.0, None
-        if "--reprise" in args:
-            k = args.index("--reprise")
-            resume = pathlib.Path(args[k + 1])
-            del args[k : k + 2]
+        weights, tests, default, files = {}, [], 1.0, {}
+        for opt in ("--reprise", "--detail"):
+            if opt in args:
+                k = args.index(opt)
+                files[opt] = pathlib.Path(args[k + 1])
+                del args[k : k + 2]
         for a in args:
             if a in ("--leger", "--essai"):
                 default = LIGHT if a == "--leger" else None
@@ -675,7 +696,7 @@ def main():
             weights[d] = (wk, float(ws) if ws else wk)
         data = load(list(dict.fromkeys(list(weights) + (tests if mode == "valider" else []))))
         if mode == "valider":
-            validate(data, weights, tests, resume)
+            validate(data, weights, tests, files.get("--reprise"), files.get("--detail"))
         else:
             C = Corpus(data)
             model = train(C, {i: weights[t["dir"]] for i, t in enumerate(C.tracks)})

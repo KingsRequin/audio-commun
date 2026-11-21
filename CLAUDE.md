@@ -15,5 +15,9 @@ README. Consignes propres à un poste : `CLAUDE.local.md` (non suivi).
   `src/kick_modele.rs` sont générés (`scripts/kick_modele.py apprendre`), jamais modifiés à la main. Le script
   refait les mesures de `kick.rs` : après un changement, `kick_modele.py detecter` et `--example kick_mesures`
   doivent donner les mêmes coups. Un seul apprentissage à la fois (mémoire).
+- Le code est public : le kick et la caisse claire se jugent sur tous les styles, pas sur ceux de l'auteur.
+  Un changement se mesure style par style (`--detail` du banc et de `kick_modele.py valider`, morceaux nommés
+  `<style>__<titre>`, tableau « Par style » du README) et à plusieurs volumes d'écoute ; un gain sur quelques
+  styles payé par une perte ailleurs n'en est pas un.
 - `spectre` est réglé pour les LED de Prisme : ne pas changer son comportement sans relancer sa sonde
   (`--example audio_probe -- 15` dans Prisme).
