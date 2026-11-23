@@ -5,13 +5,14 @@ L'accompagnement réel d'un morceau (basse + voix + reste, séparés par Demucs 
 kicks de synthèse), posés aux instants de la batterie d'origine (sa transcription) : les instants
 sont connus à l'échantillon près, et la basse et les voix restent celles d'un vrai morceau.
 
-    python kick_remix.py <données> <pistes> <banques> <sortie> [graine=1] [--essai] [--acoustique]
+    python kick_remix.py <données> <pistes> <banques> <sortie> [graine=1] [--essai] [--acoustique | --packs]
 
 - `<données>` : `<nom>.kicks` et `<nom>.caisses` des morceaux d'origine ; `<pistes>` : `<nom>.npy`
   (int16, 4 pistes drums/bass/other/vocals à 44,1 kHz) ;
 - `<banques>` : dossier contenant `tdm` (<https://github.com/geikha/tidal-drum-machines>), `dirt`
-  (<https://github.com/tidalcycles/Dirt-Samples>) et, pour `--acoustique`, `acoustique` (un dossier par
-  kit de batterie acoustique échantillonné : voir `acoustic_kits`) ;
+  (<https://github.com/tidalcycles/Dirt-Samples>), pour `--acoustique`, `acoustique` (un dossier par
+  kit de batterie acoustique échantillonné : voir `acoustic_kits`) et, pour `--packs`, `packs` (coups
+  isolés de packs de production actuels : voir `pack_kits`) ;
 - `<sortie>` : par morceau, deux extraits de ~100 s rebatterisés (`<nom>_v0`, `_v1`, kits différents,
   quelques kicks retirés : leurs instants vont dans `.kicks_doute`, un reste de l'ancien coup pouvant
   subsister) ; et dans `<sortie>sb`, un extrait sans batterie (`<nom>_v9` : aucun coup ; les instants
@@ -19,9 +20,13 @@ sont connus à l'échantillon près, et la basse et les voix restent celles d'un
 - `--acoustique` : un seul extrait par morceau, rebatterisé avec un kit acoustique : chaque coup est une
   autre frappe du même fût (nuances et variantes du kit, micros mélangés), avec parfois des notes
   fantômes à la caisse claire (`.caisses_doute`) et une cymbale ride au lieu du charleston ;
-- `--essai` : un seul extrait par morceau, avec les boîtes à rythmes (ou, avec `--acoustique`, les
-  kits) tenues à l'écart (`TEST_MACHINES`, `TEST_ACOUSTIC`), sans kick retiré : jeu d'évaluation à
-  étiquettes exactes.
+- `--packs` : un seul extrait par morceau, rebatterisé avec des coups isolés de packs de production
+  actuels (kicks de hardstyle, de techno, de trap ; caisses claires et claps d'électro) : le kick et la
+  caisse claire peuvent venir de deux kits, un clap double souvent la caisse claire ou la remplace ;
+  `<nom>_v0.sons` nomme les sons joués ;
+- `--essai` : un seul extrait par morceau, avec les boîtes à rythmes (ou, avec `--acoustique` ou
+  `--packs`, les kits) tenues à l'écart (`TEST_MACHINES`, `TEST_ACOUSTIC`, `pack_test`), sans kick
+  retiré : jeu d'évaluation à étiquettes exactes.
 
 Dépendances : numpy, scipy, soundfile.
 """
@@ -66,6 +71,10 @@ AC_SKIP = r"choke|(hat|hh)\w*[ _-]?(foot|ft|pedal)|rest|roll|flam|drag|stir|flut
 # réunir les frappes d'un même instrument.
 AC_LEVEL = r"\d+|hardest|hard|softest|soft|medium|med|(high|low)_vol|normal"
 AC_SOUND = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
+PACK_TYPES = ("bd", "sd", "cp", "hh", "oh", "tom", "cr", "perc")
+# Sons de `packs` jamais joués : ceux des boîtes à rythmes de `TEST_MACHINES` (909 retraitée, LinnDrum
+# d'un autre auteur), qui doivent rester inconnues de l'apprentissage.
+PACK_HELD = rf"909|linn|mpc[ _-]?60|korg[ _-]?m1|dr[ _-]?660|sp[ _-]?12|ry[ _-]?30|dmx|simmons|{B}(sds|r[ _-]?8){E}"
 
 
 def read(path):
@@ -108,6 +117,31 @@ def kits(smp, test):
                 k.setdefault(typ, []).extend(sorted(d.glob("*.[wW][aA][vV]")))
         if "bd" in k and "sd" in k:
             out[m.name] = k
+    return out
+
+
+def pack_test(name):
+    """Un kit de `packs` sur cinq, tiré de son nom, est tenu à l'écart pour l'évaluation."""
+    return zlib.crc32(name.encode()) % 5 == 0
+
+
+@functools.lru_cache(None)
+def pack_kits(smp, test):
+    """{kit: {type: [sons]}} des kits de `<banques>/packs/<kit>/<type>/` ; mêmes types que `kits`.
+
+    Coups isolés de packs de production actuels, rangés par `kick_packs.py ranger` (packs gratuits
+    d'éditeurs et de dépôts libres) et `kick_freesound.py` (Freesound : un kit par auteur) ; les sons
+    notés dans `packs/ecartes.txt` par `kick_packs.py trier` (attaque lente, début faible) sont laissés."""
+    out, root = {}, smp / "packs"
+    dropped = {l.split("\t")[0] for l in (root / "ecartes.txt").read_text(encoding="utf-8").splitlines()} if (root / "ecartes.txt").exists() else set()
+    for kit in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("_") and pack_test(p.name) == test):
+        heard = lambda f: (
+            f.suffix.lower() in AC_SOUND and not re.search(PACK_HELD, f"{kit.name}/{f.name}".lower()) and f.relative_to(root).as_posix() not in dropped
+        )
+        k = {d.name: sorted(f for f in d.iterdir() if heard(f)) for d in sorted(kit.iterdir()) if d.name in PACK_TYPES and d.is_dir()}
+        k = {t: fs for t, fs in k.items() if fs}
+        if k:
+            out[kit.name] = k
     return out
 
 
@@ -246,21 +280,30 @@ def times(path):
 
 
 def render(args):
-    data, stems_dir, smp, name, dst, seed, test, acoustic = args
+    data, stems_dir, smp, name, dst, seed, test, mode = args
+    acoustic = mode == "acoustique"
     rng = np.random.default_rng(zlib.crc32(name.encode()) + seed)
     stems = np.load(stems_dir / (name + ".npy")).astype(np.float32) / 32768
     back_full = stems[1] + stems[2] + stems[3]
     K, S = times(data / (name + ".kicks")), times(data / (name + ".caisses"))
     dur = len(back_full) / SR
-    allk = acoustic_kits(smp, test) if acoustic else kits(smp, test)
+    allk = {"machines": kits, "acoustique": acoustic_kits, "packs": pack_kits}[mode](smp, test)
     names = sorted(n for n, k in allk.items() if "bd" in k)
     pick = lambda xs: xs[rng.integers(len(xs))]
     ld = lambda fs: [y for y in (load_one(f) for f in fs) if y is not None]
-    for v in range(1 if test or acoustic else 2):
+
+    def among(t):
+        """Un kit de `packs` qui a le type `t` (None : aucun), les kits fournis étant tirés plus
+        souvent (racine du nombre de sons : un auteur d'un seul kick garde sa chance)."""
+        ns = sorted(n for n, k in allk.items() if t in k)
+        w = np.sqrt([len(allk[n][t]) for n in ns])
+        return allk[ns[rng.choice(len(ns), p=w / w.sum())]] if ns else None
+
+    for v in range(1 if test or mode != "machines" else 2):
         L = min(dur, 100.0)
         a = rng.uniform(0, max(0.0, dur - L))
         back = back_full[int(a * SR) : int((a + L) * SR)].copy()
-        kit = allk[pick(names)]
+        kit = among("bd") if mode == "packs" else allk[pick(names)]
         rms = np.sqrt(np.mean(back**2)) + 1e-4
         clap = None
         if acoustic:
@@ -286,20 +329,37 @@ def render(args):
 
             hit_k, hit_s = (lambda: hit(kv, gk)), (lambda: hit(sv, gs))
         else:
-            u = rng.random()
-            if test or u < 0.45:  # kick : boîte à rythmes, banque Dirt, ou synthèse
-                kick = ld([pick(kit["bd"])])
-            elif u < 0.7:
-                kick = ld([pick(dirt(smp, KICK_DIRT))])
+            if mode == "packs":
+                # Packs de production : la caisse claire vient une fois sur deux d'un autre kit ; un clap
+                # la double souvent, ou la remplace (pop, trap, house : le clap compte comme caisse claire).
+                used = {"kick": pick(kit["bd"])}
+                skit = kit if "sd" in kit and rng.random() < 0.5 else among("sd")
+                ckit = skit if "cp" in skit else among("cp")
+                if ckit and rng.random() < 0.2:
+                    used["caisse"] = pick(ckit["cp"])
+                else:
+                    used["caisse"] = pick(skit["sd"])
+                    if ckit and rng.random() < 0.4:
+                        used["clap"] = pick(ckit["cp"])
+                kick, snare, clap = ld([used["kick"]]), ld([used["caisse"]]), ld([used["clap"]]) if "clap" in used else []
+                # charleston, toms, percussions : du kit du kick s'il en a, sinon d'un autre
+                okit = {t: k[t] for t in ("hh", "oh", "tom", "cr", "perc") for k in [kit if t in kit else among(t)] if k}
             else:
-                kick = [synth_kick(rng)]
-            snare = ld([pick(kit["sd"])])
-            clap = ld([pick(kit["cp"])]) if "cp" in kit and rng.random() < 0.4 else []
+                u = rng.random()
+                if test or u < 0.45:  # kick : boîte à rythmes, banque Dirt, ou synthèse
+                    kick = ld([pick(kit["bd"])])
+                elif u < 0.7:
+                    kick = ld([pick(dirt(smp, KICK_DIRT))])
+                else:
+                    kick = [synth_kick(rng)]
+                snare = ld([pick(kit["sd"])])
+                clap = ld([pick(kit["cp"])]) if "cp" in kit and rng.random() < 0.4 else []
+                okit = kit
             if not kick or not snare:
                 continue
             kick, snare = shape(kick[0], rng), shape(snare[0], rng)
             clap = shape(clap[0], rng) if clap else None
-            others = {t: ld(list(rng.choice(kit[t], min(3, len(kit[t])), replace=False))) for t in ("hh", "oh", "tom", "cr", "perc") if t in kit}
+            others = {t: ld(list(rng.choice(okit[t], min(3, len(okit[t])), replace=False))) for t in ("hh", "oh", "tom", "cr", "perc") if t in okit}
             gk = rms * 10 ** (rng.uniform(4, 16) / 20)
             gs = gk * 10 ** (rng.uniform(-8, 2) / 20)
             gh = gk * 10 ** (rng.uniform(-22, -8) / 20)
@@ -320,8 +380,15 @@ def render(args):
         duck = np.ones_like(back)
         # compression latérale sur le kick (musique électronique) : jamais avec une batterie acoustique
         depth, rel = (10 ** (-rng.uniform(3, 12) / 20), rng.uniform(0.08, 0.3)) if not acoustic and rng.random() < 0.4 else (1.0, 0.1)
-        for t in k:
-            put(drums, t, *hit_k())
+        for j, t in enumerate(k):
+            x, g = hit_k()
+            # Kick d'un pack : monophonique, comme dans une production (le suivant coupe la queue d'un
+            # kick long de hardstyle ou d'une 808, au lieu de s'y ajouter).
+            cut = int((k[j + 1] - t) * SR) if mode == "packs" and j + 1 < len(k) else len(x)
+            if 0 < cut < len(x):
+                x = x[:cut].copy()
+                x[-min(cut, 220) :] *= np.linspace(1, 0, min(cut, 220))
+            put(drums, t, x, g)
             if depth < 1:
                 i, n = int(t * SR), int(rel * SR)
                 seg = duck[i : i + n]
@@ -365,7 +432,9 @@ def render(args):
         pathlib.Path(out + ".caisses").write_text("".join(f"{t:.4f}\n" for t in s))
         pathlib.Path(out + ".kicks_doute").write_text("".join(f"{t:.4f}\n" for t in doubt_k))
         pathlib.Path(out + ".caisses_doute").write_text("".join(f"{t:.4f}\n" for t in np.sort(doubt_s)))
-    if not test and not acoustic:  # extrait sans batterie
+        if mode == "packs":  # sons joués, pour remonter d'un extrait mal reconnu à ses sons
+            pathlib.Path(out + ".sons").write_text("".join(f"{role}\t{f.relative_to(smp / 'packs').as_posix()}\n" for role, f in used.items()), encoding="utf-8")
+    if not test and mode == "machines":  # extrait sans batterie
         L = min(dur, 60.0)
         a = rng.uniform(0, max(0.0, dur - L))
         sb = dst.parent / (dst.name + "sb")
@@ -379,14 +448,15 @@ def render(args):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a not in ("--essai", "--acoustique")]
-    if len(args) < 4:
+    args = [a for a in sys.argv[1:] if a not in ("--essai", "--acoustique", "--packs")]
+    if len(args) < 4 or ("--acoustique" in sys.argv and "--packs" in sys.argv):
         sys.exit(__doc__)
     data, stems_dir, smp, dst = map(pathlib.Path, args[:4])
-    seed, test, acoustic = int(args[4]) if len(args) > 4 else 1, "--essai" in sys.argv, "--acoustique" in sys.argv
+    seed, test = int(args[4]) if len(args) > 4 else 1, "--essai" in sys.argv
+    mode = "acoustique" if "--acoustique" in sys.argv else "packs" if "--packs" in sys.argv else "machines"
     dst.mkdir(parents=True, exist_ok=True)
     names = [f.stem for f in sorted(stems_dir.glob("*.npy")) if (data / (f.stem + ".kicks")).exists()]
     with Pool(8) as pool:
-        for name in pool.imap_unordered(render, [(data, stems_dir, smp, n, dst, seed, test, acoustic) for n in names]):
+        for name in pool.imap_unordered(render, [(data, stems_dir, smp, n, dst, seed, test, mode) for n in names]):
             pass
     print(len(names), "morceaux ->", dst)

@@ -125,6 +125,7 @@ Modèles livrés, mesurés par `kick_bench` (Rust) sur les mêmes fichiers (F1 k
 | 277 morceaux de 42 styles | 0,83 / 0,73 (jamais appris) | **0,87 / 0,80** |
 | 107 remixages à instants exacts, boîtes à rythmes jamais apprises | 0,92 / 0,74 | 0,91 / 0,73 |
 | 477 remixages à instants exacts, kits acoustiques jamais appris | 0,79 / 0,63 | **0,83 / 0,69** |
+| 477 remixages à instants exacts, packs de production actuels jamais appris (mesuré le 2026-11-23) | | 0,79 / 0,62 |
 | Faux coups par minute, 59 sons sans batterie (voix, piano, orgue, cordes, contrebasse, ASMR ; 214 min) | 0,6 / 0,6 | 1,0 / 0,5 |
 | Faux coups par minute, 31 autres sons sans batterie (chœurs, clavecin, kora, pluie, orage, train ; 96 min) | 11,6 / 7,5 (jamais appris) | **5,7 / 1,7** |
 | Faux kicks d'intro (avant le premier vrai kick, 107 morceaux) | 53 | **37** |
@@ -254,6 +255,37 @@ meilleure que le consensus), supprimer la règle « sans kick depuis 4 s, le pre
 +0,003, et 1 faux kick de plus par minute sur les sons sans batterie). Le banc de filtres sous-échantillonné
 donne les mêmes scores que le calcul à pleine cadence.
 
+Essayé le 2026-11-23, non livré : **apprendre aussi sur des packs de production actuels** (`kick_remix.py
+--packs` : 6 000 coups isolés de 578 kits, packs gratuits d'éditeurs et Freesound ; kicks de hardstyle, de
+techno, de trap, caisses claires et claps d'électro ; voir « Données »), 477 remixages de plus à 0,5. Le
+modèle 0.5.0 y est plus faible qu'ailleurs (0,79 / 0,62 sur les kits tenus à l'écart : il manque surtout
+les kicks longs de hardstyle, dont le pic vient 100 à 500 ms après l'attaque, et les claps joués seuls, dont
+il trouve 30 %), et l'ajout corrige en partie ces sons-là, mais pas la vraie musique. Validation croisée,
+les deux recettes refaites le même jour (F1 kick / F1 caisse claire) :
+
+| | Recette 0.5.0 | + remixages aux packs |
+|---|---|---|
+| 107 morceaux de l'auteur | 0,887 / 0,786 | 0,882 / 0,773 |
+| 93 morceaux variés | 0,881 / 0,830 | 0,874 / 0,819 |
+| MDB Drums | 0,797 / 0,592 | 0,779 / 0,588 |
+| 277 morceaux de 42 styles | 0,845 / 0,757 | 0,841 / 0,755 |
+| Remixages d'essai, boîtes à rythmes | 0,899 / 0,742 | 0,909 / 0,740 |
+| Remixages d'essai, packs (107 extraits, kits tenus à l'écart) | 0,759 / 0,637 | **0,797 / 0,652** |
+| Faux coups par minute, 59 sons sans batterie | 5,8 / 0,7 | 4,4 / 0,8 |
+| Faux coups par minute, 31 autres sons sans batterie | 13,1 / 3,5 | 11,6 / 4,2 |
+
+Lecture : +0,04 au kick sur des sons de packs jamais entendus, rien sur les vrais morceaux (−0,004 à −0,018,
+du même ordre que l'écart entre deux apprentissages de la même recette : la colonne de gauche diffère de
+0,00 à 0,014 de celle du tableau plus haut). Par style, des écarts des deux signes sans tendance (house
+−0,02 / −0,02, techno −0,03 au kick, trap +0,07 à la caisse claire). Le modèle appris sur toutes les données
+(gardé hors du dépôt) passe les tests et donne au banc 0,82 / 0,66 sur les 477 remixages aux packs, 0,92 /
+0,75 sur ceux aux boîtes à rythmes, et sur les morceaux appris 0,90 / 0,81 (auteur), 0,89 / 0,85 (variés),
+0,82 / 0,64 (MDB), 0,87 / 0,79 (styles), avec plus de faux kicks d'intro (48 au lieu de 37) et de faux coups
+sur les sons sans batterie appris (1,3 / 0,6 et 8,0 / 2,3 par minute au lieu de 1,0 / 0,5 et 5,7 / 1,7). Un
+gain sur des sons isolés sans gain mesurable en musique n'en est pas un : la 0.5.0 reste livrée. Ce que
+cela dit pour la suite : la limite sur la vraie musique n'est plus la variété des sons de batterie, mais la
+référence (transcription automatique) et les cas de « Pistes suivantes ».
+
 Limites connues : le kick effleuré et les balais du jazz acoustique (bebop, ballades : kick 0,47 à 0,49,
 caisse claire 0,51 à 0,61) ; les musiques sans batterie mais à percussions (salsa, percussions seules) ;
 les notes fantômes de la batterie acoustique (rappel de la caisse claire 0,46 sur MDB en validation
@@ -290,6 +322,17 @@ Hors du dépôt (droits des morceaux) ; tout se refait avec les scripts.
   pour l'évaluation. Tous libres : AVL Drumkits, Karoryfer (Big Rusty Drums, Swirly Drums, Frankensnare,
   Unruly Drums), Virtuosity Drums, MuldjordKit et les kits acoustiques de Hydrogen (adresses dans
   `acoustic_kits`, `kick_remix.py`).
+- **Remixages aux packs de production** (`kick_remix.py --packs`, essai du 2026-11-23, hors de la recette
+  livrée) : la même chose avec des coups isolés actuels. `kick_freesound.py` les cherche sur Freesound
+  (5 200 sons CC0 ou CC BY de 743 auteurs, un kit par auteur, classés d'après leur nom ; écoutes Ogg, la
+  clé d'API ne donnant pas les originaux) et `kick_packs.py ranger` range des packs gratuits d'éditeurs et
+  de dépôts libres (27 packs : MusicRadar SampleRadar, dépôts GitHub, archive.org ; liste et licences à
+  noter à côté des données, les packs SampleRadar ne se redistribuent pas). `kick_packs.py trier` écarte les
+  kicks, caisses claires et claps à l'attaque lente ou au début trop faible (282 sur 5 380). Le kick est
+  monophonique (le suivant coupe la queue d'un kick long), la caisse claire vient une fois sur deux d'un
+  autre kit, un clap la double (40 %) ou la remplace (20 %). Un kit sur cinq, tiré de son nom, est tenu à
+  l'écart pour l'évaluation (152 kits, 2 300 sons) ; les sons des boîtes à rythmes d'essai (909, LinnDrum…)
+  ne sont jamais joués. `<nom>_v0.sons` nomme les sons de chaque extrait.
 - **Sons sans batterie** : voix parlée et chantée, chœurs, piano, clavecin, orgue, accordéon, cordes,
   guitare, contrebasse, kora, sitar, didgeridoo, ASMR, nappes, pluie, orage, train, foule (fichiers `.kicks`
   et `.caisses` vides) : tout coup y est faux. 59 sons depuis la 0.4.0, 31 de plus en 0.5.0.
@@ -304,6 +347,11 @@ python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données
 python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixtest 1 --essai
 python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixac 1 --acoustique   # kits acoustiques
 python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixactest 2 --acoustique --essai
+python scripts/kick_freesound.py <fichier de la clé d'API Freesound> <banques>/packs      # coups isolés de Freesound
+python scripts/kick_packs.py ranger <packs téléchargés> <banques>/packs                   # packs d'éditeurs -> kits
+python scripts/kick_packs.py trier <banques>/packs                                        # écarte les sons qui ne sont pas des coups francs
+python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixpk 1 --packs
+python scripts/kick_remix.py <données>/perso <pistes>/perso <banques> <données>/remixpktest 2 --packs --essai
 cargo run --release --example kick_bench -- <données>/perso [sensibilité] [délai] [-v] [--detail <fichier.tsv>]
 ```
 
