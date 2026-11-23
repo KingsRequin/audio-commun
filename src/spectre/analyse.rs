@@ -3,9 +3,12 @@
 //!
 //! - **grande FFT** (~85 ms, Hamming, compensation de pente « bruit rose plat ») → banc de
 //!   filtres mel → bandes, graves / médiums / aigus, centroïde spectral, chromagramme ;
-//! - **petite FFT** (~21 ms) → flux spectral net dans le temps : attaques médium / aigu et
-//!   signal d'attaques du suivi de tempo ; la grosse caisse se lit sur la grande FFT
-//!   (seule assez fine sous 120 Hz) ;
+//! - **petite FFT** (~21 ms) → flux spectral net dans le temps : charleston et signal
+//!   d'attaques du suivi de tempo, renforcé par la montée des graves de la grande FFT (seule
+//!   assez fine sous 120 Hz) ;
+//! - grosse caisse et caisse claire : le détecteur appris de [`crate::kick`], qui tourne sur
+//!   les mêmes échantillons (un flux spectral par plage de fréquences annonçait six fois plus
+//!   de faux coups, voir le README) ; ses kicks recalent aussi la grille du tempo ;
 //! - niveaux **normalisés par canal** : chaque bande est jugée par rapport à sa propre
 //!   habitude (moyenne glissante en dB) et à son plafond récent, bornés par le niveau global
 //!   pour ne pas amplifier une bande presque vide. Une bande stable reste discrète, ses
@@ -35,10 +38,13 @@ mod tuning {
     pub const TREBLE_MIN: f32 = 4_000.0;
     /// Plages des attaques.
     pub const KICK: (f32, f32) = (40.0, 120.0);
-    pub const SNARE: (f32, f32) = (1_500.0, 5_000.0);
     pub const HIHAT: (f32, f32) = (8_000.0, 16_000.0);
     pub const OSS_MAX: f32 = 8_000.0;
     pub const OSS_KICK_WEIGHT: f32 = 2.0;
+    /// Poids d'une grosse caisse reconnue (× sa force) dans le signal du tempo. Mesuré au banc
+    /// (`tempo_bench`) : la justesse des temps monte jusqu'à 3 puis plafonne, et au-delà le
+    /// tempo n'est plus annoncé dans les passages sans kick régulier.
+    pub const OSS_HIT_WEIGHT: f32 = 3.0;
     /// Normalisation par canal (dB) : plafond (montée / descente), moyenne glissante,
     /// dynamique sous le plafond, écart à la moyenne, et portée sous le canal le plus fort
     /// au-delà de laquelle une bande est considérée vide.
@@ -344,12 +350,14 @@ pub struct Analyzer {
     gain_down: f32,
     quiet_s: f32,
     silent: bool,
+    /// Montée des graves : renfort du signal d'attaques du tempo.
     kick_flux: Flux,
-    snare_flux: Flux,
     hihat_flux: Flux,
     oss_flux: Flux,
-    kick: Onset,
-    snare: Onset,
+    /// Grosse caisse et caisse claire (détecteur appris), et leurs enveloppes.
+    drums: crate::kick::Analyzer,
+    kick: Hits,
+    snare: Hits,
     hihat: Onset,
     tempo: Tempo,
     beats: u32,
@@ -364,6 +372,36 @@ pub struct Analyzer {
     chroma: [f32; 12],
     tone: f32,
     tone_strength: f32,
+}
+
+/// Coups du détecteur appris vus d'une image à l'autre, et leur enveloppe (saute à la force du
+/// coup, retombe exponentiellement).
+struct Hits {
+    seen: u32,
+    decay: f32,
+    envelope: f32,
+}
+
+impl Hits {
+    fn new(dt: f32, decay_s: f32) -> Self {
+        Self {
+            seen: 0,
+            decay: (-dt / decay_s).exp(),
+            envelope: 0.0,
+        }
+    }
+
+    /// Une image : `count` et `force` sont le compteur et la force du dernier coup du
+    /// détecteur. Renvoie vrai si un coup est tombé depuis l'image précédente.
+    fn update(&mut self, count: u32, force: f32) -> bool {
+        let hit = count != self.seen;
+        self.seen = count;
+        self.envelope *= self.decay;
+        if hit {
+            self.envelope = self.envelope.max(force);
+        }
+        hit
+    }
 }
 
 impl Analyzer {
@@ -400,10 +438,9 @@ impl Analyzer {
             dt,
             ring: vec![0.0; n],
             pos: 0,
-            // Grosse caisse : compression faible, seules les hausses franches des graves comptent
-            // (pas les fuites d'une attaque d'aigus). Aigus : forte, ils sont faibles dans un mix.
+            // Graves : compression faible, seules les hausses franches comptent (pas les fuites
+            // d'une attaque d'aigus). Aigus : forte, ils sont faibles dans un mix.
             kick_flux: Flux::new(big.bins(KICK), 10.0),
-            snare_flux: Flux::new(small.bins(SNARE), 100.0),
             hihat_flux: Flux::new(small.bins((HIHAT.0.min(hihat_hi * 0.6), hihat_hi)), 100.0),
             oss_flux: Flux::new(small.bins((F_MIN, OSS_MAX.min(f_max))), 100.0),
             centroid_bins: big.bins(CENTROID),
@@ -423,8 +460,9 @@ impl Analyzer {
             gain_down: alpha(dt, GAIN_FALL_S),
             quiet_s: SILENT_HOLD_S,
             silent: true,
-            kick: Onset::new(dt, 1.0, 1.5, 0.04, 0.12, 0.14),
-            snare: Onset::new(dt, 1.0, 2.0, 0.05, 0.10, 0.10),
+            drums: crate::kick::Analyzer::new(sample_rate),
+            kick: Hits::new(dt, 0.14),
+            snare: Hits::new(dt, 0.10),
             hihat: Onset::new(dt, 0.75, 2.0, 0.05, 0.06, 0.06),
             tempo: Tempo::new(rate),
             beats: 0,
@@ -444,6 +482,7 @@ impl Analyzer {
 
     /// Ajoute des échantillons mono à la fenêtre glissante.
     pub fn push(&mut self, samples: &[f32]) {
+        self.drums.push(samples);
         let n = self.ring.len();
         let mut s = samples;
         if s.len() > n {
@@ -457,6 +496,7 @@ impl Analyzer {
 
     /// Ajoute `count` échantillons nuls (pas de paquet WASAPI : rien n'est joué).
     pub fn push_silence(&mut self, count: usize) {
+        self.drums.push_silence(count);
         let n = self.ring.len();
         for _ in 0..count.min(n) {
             self.ring[self.pos] = 0.0;
@@ -512,18 +552,20 @@ impl Analyzer {
         let dt = self.dt;
         let gain = self.gain;
         let kick_flux = self.kick_flux.update(&self.big.power, gain, silent);
-        let kick = self.kick.update(kick_flux, dt, silent);
-        let snare_flux = self.snare_flux.update(&self.small.power, gain, silent);
-        self.snare.update(snare_flux, dt, silent);
+        let kick = self.kick.update(self.drums.kicks, self.drums.kick_force);
+        self.snare.update(self.drums.caisses, self.drums.caisse_force);
         let hihat_flux = self.hihat_flux.update(&self.small.power, gain, silent);
         self.hihat.update(hihat_flux, dt, silent);
-        // Signal du tempo : flux global + grosse caisse renforcée (sinon les charlestons,
-        // plus nombreux, poussent vers la croche plutôt que vers le temps).
-        let oss =
-            self.oss_flux.update(&self.small.power, gain, silent) + OSS_KICK_WEIGHT * kick_flux;
+        // Signal du tempo : flux global + graves renforcés (sinon les charlestons, plus
+        // nombreux, poussent vers la croche plutôt que vers le temps) + une impulsion à chaque
+        // grosse caisse reconnue, qui cale le peigne de la phase sur les vrais kicks.
+        let hit = if kick { self.drums.kick_force } else { 0.0 };
+        let oss = self.oss_flux.update(&self.small.power, gain, silent)
+            + OSS_KICK_WEIGHT * kick_flux
+            + OSS_HIT_WEIGHT * hit;
         // Grille du tempo si elle est fiable, sinon les grosses caisses font office de temps.
-        let grid_beat = self.tempo.push(oss, kick > 0.0, silent);
-        if (self.tempo.locked() && grid_beat) || (!self.tempo.locked() && kick > 0.0) {
+        let grid_beat = self.tempo.push(oss, kick, silent);
+        if (self.tempo.locked() && grid_beat) || (!self.tempo.locked() && kick) {
             self.beats = self.beats.wrapping_add(1);
         }
 
@@ -539,8 +581,8 @@ impl Analyzer {
         out.kick = self.kick.envelope;
         out.snare = self.snare.envelope;
         out.hihat = self.hihat.envelope;
-        out.kicks = self.kick.count_total;
-        out.snares = self.snare.count_total;
+        out.kicks = self.drums.kicks;
+        out.snares = self.drums.caisses;
         out.hihats = self.hihat.count_total;
         out.beats = self.beats;
         out.bpm = self.tempo.bpm();
@@ -552,6 +594,8 @@ impl Analyzer {
         out.tone = self.tone;
         out.tone_strength = self.tone_strength;
         out.silent = silent;
+        out.kick_hits = self.drums.kicks;
+        out.kick_bass = self.drums.bass;
     }
 
     /// Silence avec hystérésis.

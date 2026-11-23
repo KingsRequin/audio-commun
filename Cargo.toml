@@ -1,7 +1,7 @@
 [package]
 name = "audio-commun"
 description = "Capture du son de Windows (WASAPI loopback) et analyses partagées par Prisme, Horizon et Essaim"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -11,7 +11,8 @@ publish = false
 default = ["capture", "spectre"]
 # Capture loopback de la sortie par défaut (Windows seulement).
 capture = ["dep:wasapi", "dep:windows", "dep:anyhow"]
-# Analyse spectrale (FFT) : bandes mel, attaques, tempo, intensité, tonalité.
+# Analyse spectrale (FFT) : bandes mel, charleston, tempo, intensité, tonalité, avec le kick et la
+# caisse claire du détecteur appris.
 spectre = ["dep:realfft"]
 
 [dependencies]
@@ -33,3 +34,12 @@ codegen-units = 1
 [[example]]
 name = "kick_probe"
 required-features = ["capture"]
+
+# Les bancs jugent aussi l'analyse spectrale.
+[[example]]
+name = "kick_bench"
+required-features = ["spectre"]
+
+[[example]]
+name = "tempo_bench"
+required-features = ["spectre"]

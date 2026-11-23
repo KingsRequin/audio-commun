@@ -4,10 +4,12 @@
 //!   dédié, avec priorité audio (MMCSS), relance quand la sortie change et silence injecté quand
 //!   rien ne joue ; sortie par défaut ou choisie ([`capture::sorties`], [`capture::start_sur`]).
 //!   Ce qu'on fait des échantillons est laissé au [`capture::Sink`].
-//! - [`spectre`] : analyse par FFT (bandes mel, attaques, tempo, intensité, tonalité), à cadence
-//!   fixe ; [`spectre::start`] la branche sur la capture.
+//! - [`spectre`] : analyse par FFT (bandes mel, charleston, tempo, intensité, tonalité), à cadence
+//!   fixe, avec la grosse caisse et la caisse claire de [`kick`] ; [`spectre::start`] la branche
+//!   sur la capture.
 //! - [`kick`] : détection de grosse caisse et de caisse claire à très faible délai (biquads,
-//!   sans FFT), niveau et hauteur de la basse ; utilisée par Essaim, qui veut réagir en 10 à 20 ms.
+//!   sans FFT), niveau et hauteur de la basse ; utilisée par Essaim, qui veut réagir en 10 à 20 ms,
+//!   et par [`spectre`].
 //! - [`pulsation`] : tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans
 //!   FFT ; relais pendant un passage sans kick.
 //!

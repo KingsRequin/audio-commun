@@ -1,5 +1,5 @@
 //! Banc d'essai du kick sur de vrais morceaux annotés :
-//! `cargo run --release --example kick_bench -- <dossier> [sensibilité=5] [délai=0.1] [-v] [--detail <fichier.tsv>]`.
+//! `cargo run --release --example kick_bench -- <dossier> [sensibilité=5] [délai=0.1] [-v] [--spectre] [--detail <fichier.tsv>]`.
 //!
 //! Le dossier contient, pour chaque morceau, `<nom>.f32` (mono, f32 petit-boutiste, 48 kHz) et
 //! `<nom>.kicks` (un instant de kick en secondes par ligne, la référence). `scripts/kick_bench.py`
@@ -17,6 +17,9 @@
 //!
 //! Si `<nom>.caisses` existe (instants des vraies caisses claires), les caisses claires
 //! détectées sont jugées de même ; leur total est affiché à la fin.
+//!
+//! `--spectre` juge à la place les attaques de l'analyse spectrale (`spectre`, compteurs `kicks` et
+//! `snares`), pour comparer les deux détecteurs sur les mêmes morceaux.
 //!
 //! `--detail` écrit une ligne par morceau et par détecteur (trouvés, annoncés, attendus, durée), dans le
 //! format de `kick_modele.py valider --detail` : de quoi regrouper les résultats par style de musique.
@@ -74,6 +77,30 @@ fn detect(samples: &[f32], sens: f32, gap: f64) -> (Vec<f64>, Vec<f64>) {
     (kicks, snares)
 }
 
+/// Les mêmes instants vus par l'analyse spectrale ([`audio_commun::spectre`], 60 images par
+/// seconde) : ses compteurs `kicks` et `snares`.
+fn detect_spectre(samples: &[f32]) -> (Vec<f64>, Vec<f64>) {
+    const RATE: u32 = 60;
+    let mut a = audio_commun::spectre::Analyzer::new(SR, 32, RATE as f32);
+    let mut out = audio_commun::spectre::AudioFeatures::default();
+    let (mut kicks, mut snares) = (Vec::new(), Vec::new());
+    let mut n = 0;
+    for chunk in samples.chunks((SR / RATE) as usize) {
+        let before = (out.kicks, out.snares);
+        a.push(chunk);
+        a.analyze(&mut out);
+        n += chunk.len();
+        let t = n as f64 / SR as f64;
+        if out.kicks != before.0 {
+            kicks.push(t);
+        }
+        if out.snares != before.1 {
+            snares.push(t);
+        }
+    }
+    (kicks, snares)
+}
+
 fn read_times(path: &Path) -> std::io::Result<Vec<f64>> {
     let mut v: Vec<f64> = std::fs::read_to_string(path)?.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
     v.sort_by(f64::total_cmp);
@@ -116,10 +143,16 @@ fn median(v: &mut [f64]) -> f64 {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "-v");
+    let spectre = args.iter().any(|a| a == "--spectre");
     let detail_at = args.iter().position(|a| a == "--detail");
-    let pos: Vec<&String> = args.iter().enumerate().filter(|&(i, a)| a != "-v" && detail_at.is_none_or(|d| i != d && i != d + 1)).map(|(_, a)| a).collect();
+    let pos: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|&(i, a)| a != "-v" && a != "--spectre" && detail_at.is_none_or(|d| i != d && i != d + 1))
+        .map(|(_, a)| a)
+        .collect();
     let Some(dir) = pos.first() else {
-        eprintln!("usage : kick_bench <dossier> [sensibilité=5] [délai=0.1] [-v] [--detail <fichier.tsv>]");
+        eprintln!("usage : kick_bench <dossier> [sensibilité=5] [délai=0.1] [-v] [--spectre] [--detail <fichier.tsv>]");
         std::process::exit(2);
     };
     let mut detail = match detail_at.and_then(|d| args.get(d + 1)) {
@@ -153,7 +186,7 @@ fn main() -> std::io::Result<()> {
         let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         let refs = read_times(&base.with_extension("kicks"))?;
         let start = std::time::Instant::now();
-        let (hits, snares) = detect(&samples, sens, gap);
+        let (hits, snares) = if spectre { detect_spectre(&samples) } else { detect(&samples, sens, gap) };
         compute += start.elapsed().as_secs_f64();
         let duration = samples.len() as f64 / SR as f64;
         seconds += duration;

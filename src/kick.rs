@@ -333,6 +333,13 @@ impl Gru {
     }
 }
 
+/// Force d'un coup reconnu avec le score `logit` : 0,4 au seuil de la dernière décision à
+/// sensibilité 5 (probabilité 0,5), 1 à partir d'une probabilité de 0,95. Sur de la musique, un
+/// quart des kicks valent 1 et la moitié dépassent 0,7.
+fn force(logit: f64) -> f32 {
+    (0.4 + 0.2 * logit).clamp(0.4, 1.0) as f32
+}
+
 /// Entrées du GRU pour un pas (dans l'ordre de `scripts/kick_modele.py`, `frame_inputs`) : niveau
 /// de chaque bande fine par rapport au plus fort pic du morceau, montée de chaque bande sur
 /// 10 ms (`old` : niveaux deux pas plus tôt), excès du sub, rapport sub / médiums.
@@ -386,6 +393,10 @@ pub struct Analyzer {
     pub kicks: u32,
     /// Nombre total de caisses claires (et claps) détectées.
     pub caisses: u32,
+    /// Force du dernier kick et de la dernière caisse claire, de 0,4 à 1 : l'assurance du réseau
+    /// qui l'a reconnu (un coup franc vaut 1, un coup tout juste retenu 0,4).
+    pub kick_force: f32,
+    pub caisse_force: f32,
     // basse
     peak_db: f64,
     bass_target: f64,
@@ -438,6 +449,8 @@ impl Analyzer {
             sensitivity: 5.0,
             kicks: 0,
             caisses: 0,
+            kick_force: 0.0,
+            caisse_force: 0.0,
             peak_db: -60.0,
             bass_target: 0.0,
             bass: 0.0,
@@ -596,28 +609,34 @@ impl Analyzer {
             }
         }
         let mut juge = std::mem::replace(&mut self.kick, Juge::new(Coup::Kick));
-        let kicks = self.decide(&mut juge, i);
+        let kick = self.decide(&mut juge, i);
         self.kick = juge;
-        if kicks > 0 {
-            self.kicks = self.kicks.wrapping_add(kicks);
+        if let Some(logit) = kick {
+            self.kicks = self.kicks.wrapping_add(1);
+            self.kick_force = force(logit);
             self.last_kick = self.t;
         }
         let mut juge = std::mem::replace(&mut self.snare, Juge::new(Coup::Caisse));
-        self.caisses = self.caisses.wrapping_add(self.decide(&mut juge, i));
+        let caisse = self.decide(&mut juge, i);
         self.snare = juge;
+        if let Some(logit) = caisse {
+            self.caisses = self.caisses.wrapping_add(1);
+            self.caisse_force = force(logit);
+        }
     }
 
     /// Juge les candidats de `juge` dont une étape de décision tombe sur le pas `i`, du plus
-    /// ancien au plus récent (ordre repris par `decisions` du script) ; renvoie le nombre de coups
-    /// reconnus.
-    fn decide(&self, juge: &mut Juge, i: u64) -> u32 {
+    /// ancien au plus récent (ordre repris par `decisions` du script) ; renvoie le score (logit) du
+    /// coup reconnu. Il n'y en a qu'un par pas : deux candidats jugés au même pas sont à 20 ms au
+    /// plus l'un de l'autre, moins que l'écart minimal entre deux coups.
+    fn decide(&self, juge: &mut Juge, i: u64) -> Option<f64> {
         let kick = juge.coup == Coup::Kick;
         // La sensibilité règle le dernier seuil du kick (combien de kicks) ; les décisions
         // précoces gardent le leur (à quel point il faut être sûr pour ne pas attendre), jamais
         // plus bas. La caisse claire garde les seuils d'un kick à sensibilité 5.
         let shift = if kick { (5.0 - self.sensitivity.clamp(1.0, 10.0) as f64) * SENS_STEP } else { 0.0 };
         let gap = if kick { self.min_gap_s.max(0.05) } else { SNARE_GAP_S };
-        let mut found = 0;
+        let mut found = None;
         let mut k = 0;
         while k < juge.pending.len() {
             let Pending { hop: p, stage } = juge.pending[k];
@@ -630,8 +649,9 @@ impl Analyzer {
             let quiet = if kick && since > QUIET_S { QUIET_RAISE } else { 0.0 };
             let last = STAGE_LOGIT[STAGES.len() - 1] + shift;
             let thr = if stage + 1 == STAGES.len() { last } else { STAGE_LOGIT[stage].max(last) } + quiet;
-            if since > gap && self.score(juge.coup, p, STAGES[stage]) > thr {
-                found += 1;
+            let score = if since > gap { self.score(juge.coup, p, STAGES[stage]) } else { f64::MIN };
+            if score > thr {
+                found = Some(score);
                 juge.last_attack = attack;
                 juge.pending.remove(k);
             } else if stage + 1 < STAGES.len() {

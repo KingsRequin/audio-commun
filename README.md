@@ -12,8 +12,8 @@ captures quasi identiques, deux analyses spectrales qui divergeaient).
 | Module | Feature | Contenu | Utilisé par |
 |---|---|---|---|
 | `capture` | `capture` | Loopback WASAPI de la sortie par défaut ou d'une sortie choisie, mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
-| `spectre` | `spectre` | FFT : bandes mel, graves/médiums/aigus, attaques kick/snare/hihat, tempo + PLL, intensité, drops, tonalité ; `spectre::start` = capture + analyse à cadence fixe | Prisme, Horizon |
-| `kick` | (toujours) | Grosse caisse et caisse claire à 15–30 ms de délai (biquads sur 10 bandes, un petit réseau récurrent pour le contexte et de petits réseaux de décision, appris, sans FFT), niveau et hauteur de la basse | Essaim |
+| `spectre` | `spectre` | FFT : bandes mel, graves/médiums/aigus, charleston, tempo + PLL, intensité, drops, tonalité ; kick et caisse claire repris de `kick` (0.6.0) ; `spectre::start` = capture + analyse à cadence fixe | Prisme, Horizon |
+| `kick` | (toujours) | Grosse caisse et caisse claire à 15–30 ms de délai (biquads sur 10 bandes, un petit réseau récurrent pour le contexte et de petits réseaux de décision, appris, sans FFT), niveau et hauteur de la basse | Essaim, et `spectre` |
 | `pulsation` | (toujours) | Tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans FFT ; relais pendant un passage sans kick | Essaim |
 
 Chaque application garde **sa propre capture** : faire passer l'analyse d'un processus à l'autre ajouterait
@@ -24,8 +24,8 @@ négligeable (une capture loopback lit le mélange déjà calculé par Windows).
 
 ```toml
 # Cargo.toml de l'application
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.5.0" }  # tout
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.5.0", default-features = false, features = ["capture"] }  # Essaim
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.6.0" }  # tout
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.6.0", default-features = false, features = ["capture"] }  # Essaim
 ```
 
 Pour la modifier en même temps qu'une application, la cloner à côté et la désigner dans le
@@ -70,6 +70,54 @@ p.bpm(); p.phase(t); p.relais(t);
 
 Tests sur signaux synthétiques : kicks réguliers à 74, 90, 120, 128 et 174 BPM avec ±12 ms de gigue → tempo à
 ±1 BPM ; 200 suites de kicks irréguliers → aucun tempo ; silence → aucun tempo.
+
+## Kick, caisse claire et temps de `spectre` (0.6.0)
+
+Jusqu'à la 0.5.0, `spectre` trouvait la grosse caisse et la caisse claire par flux spectral (hausse des
+graves de 40 à 120 Hz, des médiums de 1,5 à 5 kHz, au-dessus d'un seuil adaptatif). Depuis la 0.6.0, il fait
+tourner le détecteur appris de `kick` sur les mêmes échantillons : `kicks`, `snares`, leurs enveloppes
+(`kick`, `snare`) et `kick_hits` en viennent. La force d'un coup (0,4 à 1, valeur à laquelle saute
+l'enveloppe) est l'assurance du réseau qui l'a reconnu (`kick::Analyzer::kick_force`, `caisse_force`) : un
+coup douteux s'allume moins qu'un coup franc. Le charleston reste au flux spectral. `Options::kick` n'a
+plus d'effet (le détecteur tourne toujours).
+
+Mesuré le 2026-11-23 (`kick_bench --spectre` juge les compteurs de `spectre`), F1 kick / caisse claire, puis
+faux coups par minute :
+
+| | Flux spectral (0.5.0) | Détecteur appris (0.6.0) |
+|---|---|---|
+| 107 morceaux de l'auteur | 0,55 / 0,35 ; 67 / 104 | 0,91 / 0,82 ; 6,7 / 6,5 |
+| 93 morceaux variés | 0,64 / 0,41 ; 63 / 99 | 0,89 / 0,85 ; 9,9 / 8,5 |
+| MDB Drums | 0,62 / 0,44 ; 74 / 91 | 0,82 / 0,65 ; 10 / 14 |
+| 277 morceaux de 42 styles | 0,64 / 0,40 ; 61 / 102 | 0,87 / 0,80 ; 8,6 / 9,2 |
+| 59 sons sans batterie (voix, piano, ambiances) | 120 / 136 faux par minute | 1,0 / 0,5 |
+
+Le suivi du tempo (`spectre/tempo.rs`) garde son signal d'attaques (flux global + montée des graves), plus
+une impulsion à chaque kick reconnu (3 × sa force) ; ces kicks recalent aussi la phase, et font office de
+temps quand aucun tempo n'est annoncé. `tempo_bench` le mesure sans temps annotés : la référence est la
+grille que `pulsation` tire des kicks de référence, là où ils sont réguliers. Précision / rappel des temps
+(de 50 ms avant à 90 ms après un temps de la grille), part du temps où le tempo annoncé est le bon, et temps
+émis par minute quand aucun tempo n'est annoncé :
+
+| | 0.5.0 | 0.6.0 |
+|---|---|---|
+| 107 morceaux de l'auteur (106 min de grille) | 0,66 / 0,62 ; 73 % ; 108 | 0,83 / 0,76 ; 77 % ; 32 |
+| 93 morceaux variés (150 min) | 0,68 / 0,67 ; 81 % ; 138 | 0,85 / 0,82 ; 84 % ; 42 |
+| 277 morceaux de 42 styles (205 min) | 0,74 / 0,77 ; 86 % ; 124 | 0,87 / 0,88 ; 86 % ; 38 |
+| 59 sons sans batterie | 122 temps par minute | 1,1 |
+
+Le décalage médian des temps passe de 48 à 37 ms. Étapes : les kicks appris à la place du flux (recalage de
+la phase, temps sans tempo) donnent 0,68 / 0,62 sur les morceaux de l'auteur, l'impulsion dans le signal
+d'attaques le reste (poids 1 : 0,77 / 0,70 ; 3 : 0,83 / 0,76 ; 6 et 12 : pareil, mais le tempo n'est plus
+annoncé dans les passages sans kick régulier). L'impulsion ne remplace pas la montée des graves : poids 1
+sans elle, 0,68 / 0,62.
+Par style (32 styles ont au moins 30 s de grille) : la hausse est forte là où le kick porte le temps (house
+0,62 → 0,89, techno 0,65 → 0,96, trance 0,63 → 0,86, indus et eurodance 0,57 → 0,97, pop latine 0,73 → 0,95,
+reggae 0,26 → 0,55) ; cinq styles perdent un peu, sur 2 à 4 morceaux chacun (bass music 0,75 → 0,71 de
+précision, swing 0,71 → 0,68, et 0,03 à 0,07 de rappel en folk, rock classique et trip-hop, où le tempo est
+annoncé moins souvent).
+
+Coût : l'analyse passe de 0,17 % à 0,40 % d'un cœur (Prisme ; Horizon faisait déjà tourner les deux).
 
 ## Vérification
 

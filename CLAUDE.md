@@ -20,4 +20,6 @@ README. Consignes propres à un poste : `CLAUDE.local.md` (non suivi).
   `<style>__<titre>`, tableau « Par style » du README) et à plusieurs volumes d'écoute ; un gain sur quelques
   styles payé par une perte ailleurs n'en est pas un.
 - `spectre` est réglé pour les LED de Prisme : ne pas changer son comportement sans relancer sa sonde
-  (`--example audio_probe -- 15` dans Prisme).
+  (`--example audio_probe -- 15` dans Prisme). Ses kicks et caisses claires sont ceux de `kick`
+  (`kick_bench --spectre` les juge) ; ses temps se mesurent avec `--example tempo_bench` (README, « Kick,
+  caisse claire et temps de `spectre` »).

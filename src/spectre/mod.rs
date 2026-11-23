@@ -27,8 +27,9 @@ pub struct AudioFeatures {
     pub bass: f32,
     pub mid: f32,
     pub treble: f32,
-    /// Enveloppes d'attaque : sautent à la force de l'attaque puis retombent en ~0,1 s.
-    /// Grosse caisse (40–120 Hz), caisse claire / claps (1,5–5 kHz), charleston (> 8 kHz).
+    /// Enveloppes d'attaque : sautent à la force de l'attaque (0,4 à 1) puis retombent en
+    /// ~0,1 s. Grosse caisse et caisse claire / claps : détecteur appris ([`crate::kick`]) ;
+    /// charleston : flux spectral au-dessus de 8 kHz.
     pub kick: f32,
     pub snare: f32,
     pub hihat: f32,
@@ -57,8 +58,8 @@ pub struct AudioFeatures {
     pub tone_strength: f32,
     /// Sous le seuil de silence.
     pub silent: bool,
-    /// Détecteur fin d'Essaim ([`crate::kick`], seulement avec `Options::kick`) : compteur de
-    /// grosses caisses (sans les caisses claires, délai 10–20 ms) et basse lissée (0–1).
+    /// Le même compteur que `kicks` (gardé pour les applications écrites quand `kicks` venait
+    /// du flux spectral), et la basse lissée du détecteur appris (0–1).
     pub kick_hits: u32,
     pub kick_bass: f32,
 }
@@ -104,7 +105,8 @@ pub struct Options {
     pub bands: usize,
     /// Images d'analyse par seconde.
     pub rate: f32,
-    /// Fait aussi tourner le détecteur de kick d'Essaim (`kick_hits`, `kick_bass`).
+    /// Sans effet depuis la 0.6.0 : le détecteur appris tourne toujours. Gardé pour les
+    /// applications qui le règlent encore.
     pub kick: bool,
 }
 
@@ -134,7 +136,6 @@ pub fn start(
         dt: std::time::Duration::from_secs_f32(1.0 / opts.rate),
         opts,
         analyzer: None,
-        kick: None,
         features: AudioFeatures::default(),
         next_tick: std::time::Instant::now(),
         out,
@@ -148,8 +149,6 @@ struct Runner {
     opts: Options,
     dt: std::time::Duration,
     analyzer: Option<Analyzer>,
-    /// Détecteur fin, si `opts.kick`.
-    kick: Option<crate::kick::Analyzer>,
     features: AudioFeatures,
     next_tick: std::time::Instant,
     out: std::sync::Arc<std::sync::Mutex<AudioFeatures>>,
@@ -168,7 +167,6 @@ impl Runner {
 impl crate::capture::Sink for Runner {
     fn open(&mut self, sample_rate: u32) {
         self.analyzer = Some(Analyzer::new(sample_rate, self.opts.bands, self.opts.rate));
-        self.kick = self.opts.kick.then(|| crate::kick::Analyzer::new(sample_rate));
         self.next_tick = std::time::Instant::now() + self.dt;
     }
 
@@ -176,17 +174,11 @@ impl crate::capture::Sink for Runner {
         if let Some(a) = &mut self.analyzer {
             a.push(mono);
         }
-        if let Some(k) = &mut self.kick {
-            k.push(mono);
-        }
     }
 
     fn silence(&mut self, frames: usize) {
         if let Some(a) = &mut self.analyzer {
             a.push_silence(frames);
-        }
-        if let Some(k) = &mut self.kick {
-            k.push_silence(frames);
         }
     }
 
@@ -194,9 +186,6 @@ impl crate::capture::Sink for Runner {
         if now >= self.next_tick {
             if let Some(a) = &mut self.analyzer {
                 a.analyze(&mut self.features);
-                if let Some(k) = &self.kick {
-                    (self.features.kick_hits, self.features.kick_bass) = (k.kicks, k.bass);
-                }
                 self.publish();
             }
             self.next_tick += self.dt;
