@@ -2,7 +2,8 @@
 //!
 //! - [`capture`] : lit une sortie son en loopback (WASAPI, mode événement, mono) dans un fil
 //!   dédié, avec priorité audio (MMCSS), relance quand la sortie change et silence injecté quand
-//!   rien ne joue ; sortie par défaut ou choisie ([`capture::sorties`], [`capture::start_sur`]).
+//!   rien ne joue ; sortie par défaut ou choisie ([`capture::sorties`], [`capture::start_sur`]),
+//!   ou son de certaines applications ([`capture::applis_sonores`], [`capture::start_ecoute`]).
 //!   Ce qu'on fait des échantillons est laissé au [`capture::Sink`].
 //! - [`spectre`] : analyse par FFT (bandes mel, charleston, tempo, intensité, tonalité), à cadence
 //!   fixe, avec la grosse caisse et la caisse claire de [`kick`] ; [`spectre::start`] la branche

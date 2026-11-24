@@ -12,6 +12,14 @@
 //! une sortie précise choisie dans [`sorties`]. Si la sortie choisie disparaît (casque
 //! débranché, carte désactivée), la capture se replie sur la sortie par défaut et revient sur
 //! la choisie dès qu'elle est de nouveau active (vérifié toutes les 2 s).
+//!
+//! Ou seulement le son de certaines applications ([`Ecoute::Applis`], [`start_ecoute`]) :
+//! capture « process loopback » de Windows 10 2004+, détaillée dans le module `applis` ;
+//! [`applis_sonores`] liste les applications qui ont une session audio.
+
+mod applis;
+
+pub use applis::applis_sonores;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -74,6 +82,44 @@ impl Sortie {
     }
 }
 
+/// Ce que la capture écoute : tout le son d'une sortie, ou seulement celui de certaines
+/// applications.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ecoute {
+    /// Tout le mélange de Windows sur cette sortie.
+    Sortie(Sortie),
+    /// Le son de ces applications seulement, par nom d'exécutable (`spotify.exe`, ou
+    /// `spotify` : l'extension `.exe` est sous-entendue ; casse indifférente), quelle que soit la
+    /// sortie sur laquelle elles jouent. Une appli absente est attendue (ajoutée dès qu'elle est
+    /// lancée, vérifié toutes les 2 s) ; tant qu'aucune ne tourne, du silence est remis. Liste
+    /// vide = silence (voir [`Ecoute::depuis_reglages`] pour « aucune appli = tout »).
+    Applis(Vec<String>),
+}
+
+impl Default for Ecoute {
+    fn default() -> Self {
+        Self::Sortie(Sortie::ParDefaut)
+    }
+}
+
+impl Ecoute {
+    /// D'après des réglages : les applis données (noms vides ignorés), ou à défaut toute la
+    /// sortie `sortie_id` (vide = sortie par défaut, comme [`Sortie::depuis_id`]).
+    pub fn depuis_reglages<S: AsRef<str>>(sortie_id: &str, applis: &[S]) -> Self {
+        let applis: Vec<String> = applis
+            .iter()
+            .map(|a| a.as_ref().trim())
+            .filter(|a| !a.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if applis.is_empty() {
+            Self::Sortie(Sortie::depuis_id(sortie_id))
+        } else {
+            Self::Applis(applis)
+        }
+    }
+}
+
 /// Sorties son actives de Windows, `(identifiant, nom affiché)`, dans l'ordre de Windows ;
 /// liste vide si Windows ne répond pas. Appelable depuis n'importe quel fil : COM y est
 /// initialisé au besoin (et laissé tel quel s'il l'était déjà, en STA par exemple).
@@ -112,11 +158,19 @@ pub fn start(name: &str, sink: impl Sink) -> std::io::Result<Capture> {
 /// Lance la capture de `sortie` dans un fil nommé `name` (sur la sortie par défaut tant que
 /// la sortie choisie est absente).
 pub fn start_sur(name: &str, sortie: Sortie, sink: impl Sink) -> std::io::Result<Capture> {
+    start_ecoute(name, Ecoute::Sortie(sortie), sink)
+}
+
+/// Lance l'écoute de `ecoute` dans un fil nommé `name`. Pour [`Ecoute::Applis`] : fréquence
+/// fixe de 48 000 Hz (Windows convertit), son des applis additionné ; si Windows refuse la
+/// capture par application (version antérieure à Windows 10 2004, activation refusée), une
+/// ligne de journal et toute la sortie par défaut est écoutée à la place, jusqu'à l'arrêt.
+pub fn start_ecoute(name: &str, ecoute: Ecoute, sink: impl Sink) -> std::io::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let thread = std::thread::Builder::new()
         .name(name.into())
-        .spawn(move || run(sink, &sortie, &s))?;
+        .spawn(move || run(sink, &ecoute, &s))?;
     Ok(Capture {
         stop,
         thread: Some(thread),
@@ -132,15 +186,33 @@ const MAX_WAIT_MS: u128 = 20;
 /// Erreurs répétées : une ligne de journal toutes les 30 s au plus.
 const ERROR_LOG: Duration = Duration::from_secs(30);
 
-fn run(mut sink: impl Sink, sortie: &Sortie, stop: &AtomicBool) {
+fn run(mut sink: impl Sink, ecoute: &Ecoute, stop: &AtomicBool) {
     if wasapi::initialize_mta().is_err() {
         log::warn!("audio : initialisation COM impossible");
     }
-    let _mmcss = Mmcss::register();
+    let mmcss = Mmcss::register();
+    match ecoute {
+        Ecoute::Sortie(sortie) => ecouter_sortie(&mut sink, sortie, stop),
+        Ecoute::Applis(noms) => {
+            if let Err(e) = applis::ecouter(&mut sink, noms, stop) {
+                log::warn!(
+                    "audio : capture par application impossible ({e:#}), toute la sortie par                      défaut est écoutée"
+                );
+                sink.lost();
+                ecouter_sortie(&mut sink, &Sortie::ParDefaut, stop);
+            }
+        }
+    }
+    drop(mmcss);
+    wasapi::deinitialize();
+}
+
+/// Écoute toute une sortie jusqu'à l'arrêt, en relançant le flux après chaque erreur.
+fn ecouter_sortie(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) {
     let mut last_error_log: Option<Instant> = None;
     let mut hidden = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = stream(&mut sink, sortie, stop) {
+        if let Err(e) = stream(sink, sortie, stop) {
             let now = Instant::now();
             if last_error_log.is_none_or(|t| now.duration_since(t) >= ERROR_LOG) {
                 let masked = if hidden > 0 {
@@ -164,7 +236,6 @@ fn run(mut sink: impl Sink, sortie: &Sortie, stop: &AtomicBool) {
             }
         }
     }
-    wasapi::deinitialize();
 }
 
 /// La sortie `id` existe-t-elle et est-elle active ?
@@ -313,10 +384,23 @@ fn drain(
 /// Stéréo f32 entrelacée (octets little-endian) → mono ; renvoie le niveau efficace (RMS) de
 /// chaque canal (gauche, droite). Les valeurs non finies ne comptent pas dans les niveaux.
 fn mix_mono(stereo: &[u8], mono: &mut [f32]) -> (f32, f32) {
+    mono_et_niveaux(trames(stereo), mono)
+}
+
+/// Stéréo f32 entrelacée (octets little-endian) → trames `[gauche, droite]`.
+fn trames(stereo: &[u8]) -> impl Iterator<Item = [f32; 2]> + '_ {
+    stereo.chunks_exact(8).map(|fr| {
+        [
+            f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]),
+            f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]),
+        ]
+    })
+}
+
+/// Trames stéréo → mono (moyenne des deux canaux) ; renvoie le niveau efficace de chaque canal.
+fn mono_et_niveaux(trames: impl Iterator<Item = [f32; 2]>, mono: &mut [f32]) -> (f32, f32) {
     let (mut sl, mut sr, mut n) = (0.0f32, 0.0f32, 0usize);
-    for (m, fr) in mono.iter_mut().zip(stereo.chunks_exact(8)) {
-        let l = f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]);
-        let r = f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]);
+    for (m, [l, r]) in mono.iter_mut().zip(trames) {
         *m = 0.5 * (l + r);
         if l.is_finite() && r.is_finite() {
             (sl, sr) = (sl + l * l, sr + r * r);
@@ -358,7 +442,7 @@ impl Drop for Mmcss {
 
 #[cfg(test)]
 mod tests {
-    use super::{mix_mono, suivi, Sortie, Suivi};
+    use super::{mix_mono, suivi, Ecoute, Sortie, Suivi};
 
     /// Essai sur les vraies sorties de la machine :
     /// `cargo test --release sorties_reelles -- --ignored --nocapture`.
@@ -403,6 +487,23 @@ mod tests {
             Sortie::depuis_id("{0.0.0}.{abc}"),
             Sortie::Id("{0.0.0}.{abc}".into())
         );
+    }
+
+    #[test]
+    fn reglages_sans_appli_veulent_dire_toute_la_sortie() {
+        assert_eq!(
+            Ecoute::depuis_reglages("", &[] as &[&str]),
+            Ecoute::Sortie(Sortie::ParDefaut)
+        );
+        assert_eq!(
+            Ecoute::depuis_reglages("casque", &[" ", ""]),
+            Ecoute::Sortie(Sortie::Id("casque".into()))
+        );
+        assert_eq!(
+            Ecoute::depuis_reglages("casque", &[" Spotify.exe ", "", "chrome"]),
+            Ecoute::Applis(vec!["Spotify.exe".into(), "chrome".into()])
+        );
+        assert_eq!(Ecoute::default(), Ecoute::Sortie(Sortie::ParDefaut));
     }
 
     #[test]

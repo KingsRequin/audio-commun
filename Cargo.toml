@@ -1,7 +1,7 @@
 [package]
 name = "audio-commun"
 description = "Capture du son de Windows (WASAPI loopback) et analyses partagées par Prisme, Horizon et Essaim"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = ["capture", "spectre"]
-# Capture loopback de la sortie par défaut (Windows seulement).
+# Capture loopback d'une sortie ou de certaines applications (Windows seulement).
 capture = ["dep:wasapi", "dep:windows", "dep:anyhow"]
 # Analyse spectrale (FFT) : bandes mel, charleston, tempo, intensité, tonalité, avec le kick et la
 # caisse claire du détecteur appris.
@@ -24,7 +24,14 @@ realfft = { version = "3.5", optional = true }
 [dependencies.windows]
 version = "0.62"
 optional = true
-features = ["Win32_Foundation", "Win32_System_Threading"]
+features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # Processus et leur parent (capture par application)
+    "Win32_System_Diagnostics_ToolHelp",
+    # Description de l'exécutable (nom affichable des applis sonores)
+    "Win32_Storage_FileSystem",
+]
 
 [profile.release]
 lto = "thin"

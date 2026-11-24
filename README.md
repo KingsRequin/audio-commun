@@ -11,7 +11,7 @@ captures quasi identiques, deux analyses spectrales qui divergeaient).
 
 | Module | Feature | Contenu | Utilisé par |
 |---|---|---|---|
-| `capture` | `capture` | Loopback WASAPI de la sortie par défaut ou d'une sortie choisie, mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
+| `capture` | `capture` | Loopback WASAPI de la sortie par défaut, d'une sortie choisie ou de certaines applications (0.7.0), mode événement, mono, MMCSS « Pro Audio », relance si la sortie change, silence injecté | les trois |
 | `spectre` | `spectre` | FFT : bandes mel, graves/médiums/aigus, charleston, tempo + PLL, intensité, drops, tonalité ; kick et caisse claire repris de `kick` (0.6.0) ; `spectre::start` = capture + analyse à cadence fixe | Prisme, Horizon |
 | `kick` | (toujours) | Grosse caisse et caisse claire à 15–30 ms de délai (biquads sur 10 bandes, un petit réseau récurrent pour le contexte et de petits réseaux de décision, appris, sans FFT), niveau et hauteur de la basse | Essaim, et `spectre` |
 | `pulsation` | (toujours) | Tempo (BPM) et phase du temps d'après les seuls instants des kicks, sans FFT ; relais pendant un passage sans kick | Essaim |
@@ -24,8 +24,8 @@ négligeable (une capture loopback lit le mélange déjà calculé par Windows).
 
 ```toml
 # Cargo.toml de l'application
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.6.0" }  # tout
-audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.6.0", default-features = false, features = ["capture"] }  # Essaim
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.7.0" }  # tout
+audio-commun = { git = "https://github.com/KingsRequin/audio-commun", tag = "v0.7.0", default-features = false, features = ["capture"] }  # Essaim
 ```
 
 Pour la modifier en même temps qu'une application, la cloner à côté et la désigner dans le
@@ -43,6 +43,44 @@ audio-commun = { path = "../audio-commun" }
 sorties actives, `(identifiant, nom affiché)`, et `Sortie::depuis_id("")` donne `Sortie::ParDefaut` (pratique
 pour un réglage vide). Si la sortie choisie disparaît, la capture se replie sur la sortie par défaut et revient
 sur la choisie dès qu'elle est de nouveau active (vérification toutes les 2 s, comme la sortie par défaut).
+
+## Son de certaines applications (`capture`, 0.7.0)
+
+`capture::start_ecoute(nom, ecoute, sink)` lance la capture d'une `Ecoute` : `Ecoute::Sortie(sortie)` (tout le
+mélange, comme `start_sur`, qui passe désormais par là sans changer de comportement) ou
+`Ecoute::Applis(vec!["spotify.exe".into(), "chrome.exe".into()])`, le son de ces applications seulement, quelle
+que soit la sortie où elles jouent (capture « process loopback » de Windows 10 2004 et suivants). Mêmes appels
+au `Sink` (`open`, `samples` en mono, `stereo`, `silence`, `tick`, `lost`), même MMCSS.
+`Ecoute::depuis_reglages(sortie_id, &applis)` donne `Applis` si la liste contient un nom, sinon toute la sortie
+(`Sortie::depuis_id`) : aucune appli cochée = tout le son.
+
+- **Noms** : nom d'exécutable, casse indifférente, `.exe` facultatif. Pour chacun, la capture vise la racine de
+  l'arbre de processus de l'appli (le processus de ce nom dont le parent n'a pas le même nom), enfants compris :
+  un navigateur joue le son depuis un processus enfant. Deux instances indépendantes = deux racines.
+- **Format** : f32 stéréo à 48 000 Hz imposé (`open(48000)`), converti par Windows ; ce mode ne donne ni format de
+  mélange ni période.
+- **Mélange** : un client par racine, sommés. Chacun remplit sa file ; la somme n'avance que jusqu'à la plus courte
+  des files des clients qui jouent (paquet depuis 30 ms au plus). Un client muet compte comme du zéro et ne
+  retient pas les autres ; un client en retard ne retient pas plus de 100 ms.
+- **Suivi** : la liste des processus est revérifiée toutes les 2 s (appli lancée après coup : ajoutée ; fermée :
+  retirée, une ligne de journal chaque fois). Appli absente, ou rien ne joue : du silence est remis, comme pour une
+  sortie entière. Les ouvertures prennent 10 ms au plus par tour de boucle (la suite au tour suivant), pour que le
+  son des applis déjà ouvertes continue de passer ; au-delà de 64 clients, les suivants sont lus à chaque réveil
+  sans être attendus.
+- **Repli** : au lancement, un essai de capture sur le processus appelant dit si Windows sait faire. S'il refuse
+  (Windows trop ancien, activation refusée) : une ligne de journal, `lost()`, puis toute la sortie par défaut
+  jusqu'à l'arrêt de la capture. Un processus précis que Windows refuse (protégé) : une ligne de journal, il est
+  ignoré tant qu'il tourne, les autres sont écoutés.
+
+`capture::applis_sonores()` liste les applications qui ont en ce moment une session audio sur une sortie active,
+`(exécutable, nom affichable)` : sans les sons système (pid 0, programmes de `System32` et `SysWOW64`, processus d'un autre compte
+dont le chemin est illisible : « Écouter ce périphérique » joue un micro depuis un `svchost.exe` de service) ni le processus appelant, une fois par exécutable,
+triées par nom affichable (description de l'exécutable, « Google Chrome », à défaut nom de la session, à défaut
+exécutable sans `.exe`). Appelable depuis n'importe quel fil, comme `sorties()`. Une appli garde sa session tant
+qu'elle a un flux ouvert, même en pause : la liste dit « peut jouer », pas « joue ».
+
+Essai réel : `cargo test --release applis_reelles -- --ignored --nocapture` (liste les applis sonores, capture
+600 ms d'une appli absente, de la première appli listée et de toutes ensemble).
 
 ## Niveaux stéréo (`capture`)
 
