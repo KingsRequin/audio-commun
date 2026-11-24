@@ -27,14 +27,20 @@ const TAUX: u32 = 48_000;
 /// avance sans attendre (100 ms).
 const RETARD_MAX: usize = TAUX as usize / 10;
 
-/// Applications qui ont en ce moment une session audio sur une sortie active, `(exécutable,
-/// nom affichable)` : sans les sons système (pid 0, programmes du dossier système de Windows,
-/// processus d'un autre compte) ni ce processus-ci, une seule fois par exécutable (casse
-/// indifférente), triées par nom affichable. Le nom affichable est la description de
-/// l'exécutable (« Google Chrome »), à défaut celui de la session, à défaut l'exécutable sans
-/// `.exe`. Liste vide si Windows ne répond pas. Appelable depuis n'importe quel fil, comme
-/// [`super::sorties`].
-pub fn applis_sonores() -> Vec<(String, String)> {
+/// Seuil de niveau crête (0 à 1) d'une session au-dessus duquel son appli « joue » (−60 dBFS).
+const JOUE: f32 = 0.001;
+
+/// Application qui a une session audio : son exécutable, son nom affichable, et si elle joue en
+/// ce moment (une session active dont le niveau crête dépasse −60 dBFS).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliSonore {
+    pub exe: String,
+    pub nom: String,
+    pub joue: bool,
+}
+
+/// Comme [`applis_sonores`], en disant pour chaque appli si elle joue en ce moment.
+pub fn applis_sonores_detail() -> Vec<AppliSonore> {
     let init = wasapi::initialize_mta();
     let liste = lire_applis().unwrap_or_else(|e| {
         log::warn!("audio : liste des applis sonores illisible : {e:#}");
@@ -46,7 +52,21 @@ pub fn applis_sonores() -> Vec<(String, String)> {
     liste
 }
 
-fn lire_applis() -> anyhow::Result<Vec<(String, String)>> {
+/// Applications qui ont en ce moment une session audio sur une sortie active, `(exécutable,
+/// nom affichable)` : sans les sons système (pid 0, programmes du dossier système de Windows,
+/// processus d'un autre compte) ni ce processus-ci, une seule fois par exécutable (casse
+/// indifférente), triées par nom affichable. Le nom affichable est la description de
+/// l'exécutable (« Google Chrome »), à défaut celui de la session, à défaut l'exécutable sans
+/// `.exe`. Liste vide si Windows ne répond pas. Appelable depuis n'importe quel fil, comme
+/// [`super::sorties`].
+pub fn applis_sonores() -> Vec<(String, String)> {
+    applis_sonores_detail()
+        .into_iter()
+        .map(|a| (a.exe, a.nom))
+        .collect()
+}
+
+fn lire_applis() -> anyhow::Result<Vec<AppliSonore>> {
     let procs = processus()?;
     let moi = std::process::id();
     let racine = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
@@ -86,14 +106,23 @@ fn lire_applis() -> anyhow::Result<Vec<(String, String)>> {
                 continue;
             }
             let session_nom = session.get_display_name().ok();
-            applis.push((p.nom.clone(), chemin, session_nom));
+            // joue : session active et son niveau crête au-dessus du seuil
+            let joue = session
+                .get_state()
+                .is_ok_and(|s| s == wasapi::SessionState::Active)
+                && session
+                    .get_audiometerinformation()
+                    .and_then(|m| m.get_peak_value())
+                    .is_ok_and(|v| v > JOUE);
+            applis.push((p.nom.clone(), chemin, session_nom, joue));
         }
     }
     let applis = applis
         .into_iter()
-        .map(|(exe, chemin, session)| {
-            let nom = nom_affichable(&exe, description(&chemin), session);
-            (exe, nom)
+        .map(|(exe, chemin, session, joue)| AppliSonore {
+            nom: nom_affichable(&exe, description(&chemin), session),
+            exe,
+            joue,
         })
         .collect();
     Ok(ranger(applis))
@@ -110,19 +139,17 @@ fn de_windows(chemin: &str, racine: &str) -> bool {
         .any(|d| chemin.starts_with(&format!(r"{racine}\{d}\")))
 }
 
-/// Une seule entrée par exécutable (la première), triée par nom affichable puis exécutable.
-fn ranger(applis: Vec<(String, String)>) -> Vec<(String, String)> {
-    let mut vues: Vec<String> = Vec::new();
-    let mut liste: Vec<(String, String)> = applis
-        .into_iter()
-        .filter(|(exe, _)| {
-            let cle = normaliser(exe);
-            let nouvelle = !vues.contains(&cle);
-            vues.push(cle);
-            nouvelle
-        })
-        .collect();
-    liste.sort_by_cached_key(|(exe, nom)| (nom.to_lowercase(), exe.to_lowercase()));
+/// Une seule entrée par exécutable (la première ; elle joue si l'une de ses sessions joue),
+/// triée par nom affichable puis exécutable.
+fn ranger(applis: Vec<AppliSonore>) -> Vec<AppliSonore> {
+    let mut liste: Vec<AppliSonore> = Vec::new();
+    for a in applis {
+        match liste.iter_mut().find(|x| normaliser(&x.exe) == normaliser(&a.exe)) {
+            Some(x) => x.joue |= a.joue,
+            None => liste.push(a),
+        }
+    }
+    liste.sort_by_cached_key(|a| (a.nom.to_lowercase(), a.exe.to_lowercase()));
     liste
 }
 
@@ -584,7 +611,7 @@ fn remettre(sink: &mut impl Sink, somme: &[[f32; 2]], mono: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        de_windows, nom_affichable, normaliser, racines, ranger, Melange, Processus, RETARD_MAX,
+        de_windows, nom_affichable, AppliSonore, normaliser, racines, ranger, Melange, Processus, RETARD_MAX,
     };
     use std::time::{Duration, Instant};
 
@@ -635,18 +662,24 @@ mod tests {
 
     #[test]
     fn applis_sans_doublon_et_triees() {
+        let a = |exe: &str, nom: &str, joue: bool| AppliSonore {
+            exe: exe.into(),
+            nom: nom.into(),
+            joue,
+        };
         let liste = ranger(vec![
-            ("Spotify.exe".into(), "Spotify".into()),
-            ("chrome.exe".into(), "Google Chrome".into()),
-            ("spotify.exe".into(), "Spotify (2)".into()),
-            ("discord.exe".into(), "discord".into()),
+            a("Spotify.exe", "Spotify", false),
+            a("chrome.exe", "Google Chrome", false),
+            a("spotify.exe", "Spotify (2)", true),
+            a("discord.exe", "discord", false),
         ]);
+        // une seule entrée par exécutable, qui joue si l'une de ses sessions joue
         assert_eq!(
             liste,
             vec![
-                ("discord.exe".into(), "discord".into()),
-                ("chrome.exe".into(), "Google Chrome".into()),
-                ("Spotify.exe".into(), "Spotify".into()),
+                a("discord.exe", "discord", false),
+                a("chrome.exe", "Google Chrome", false),
+                a("Spotify.exe", "Spotify", true),
             ]
         );
     }
@@ -815,14 +848,14 @@ mod tests {
             }
             fn lost(&mut self) {}
         }
-        let applis = crate::capture::applis_sonores();
+        let applis = crate::capture::applis_sonores_detail();
         println!("applis sonores : {applis:#?}");
         let mut essais = vec![vec!["essai-inexistant.exe".to_owned()]];
-        if let Some((exe, _)) = applis.first() {
-            essais.push(vec![exe.clone()]);
+        if let Some(a) = applis.first() {
+            essais.push(vec![a.exe.clone()]);
         }
         if applis.len() >= 2 {
-            essais.push(applis.iter().map(|(e, _)| e.clone()).collect());
+            essais.push(applis.iter().map(|a| a.exe.clone()).collect());
         }
         for noms in essais {
             let c = Arc::new(Comptes::default());

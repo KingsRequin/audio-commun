@@ -19,7 +19,7 @@
 
 mod applis;
 
-pub use applis::applis_sonores;
+pub use applis::{applis_sonores, applis_sonores_detail, AppliSonore};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

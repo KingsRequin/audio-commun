@@ -77,7 +77,9 @@ au `Sink` (`open`, `samples` en mono, `stereo`, `silence`, `tick`, `lost`), mêm
 dont le chemin est illisible : « Écouter ce périphérique » joue un micro depuis un `svchost.exe` de service) ni le processus appelant, une fois par exécutable,
 triées par nom affichable (description de l'exécutable, « Google Chrome », à défaut nom de la session, à défaut
 exécutable sans `.exe`). Appelable depuis n'importe quel fil, comme `sorties()`. Une appli garde sa session tant
-qu'elle a un flux ouvert, même en pause : la liste dit « peut jouer », pas « joue ».
+qu'elle a un flux ouvert, même en pause : la liste dit « peut jouer », pas « joue ». `capture::applis_sonores_detail()`
+(0.7.1) donne la même liste en `AppliSonore { exe, nom, joue }` : `joue` est vrai quand une de ses sessions est active
+et que son niveau crête dépasse −60 dBFS.
 
 Essai réel : `cargo test --release applis_reelles -- --ignored --nocapture` (liste les applis sonores, capture
 600 ms d'une appli absente, de la première appli listée et de toutes ensemble).
