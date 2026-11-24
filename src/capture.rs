@@ -4,9 +4,12 @@
 //! mélangée en mono), et remet chaque paquet au [`Sink`] dès son arrivée, avec le niveau de
 //! chaque canal ([`Sink::stereo`]). Sans son, Windows
 //! n'envoie aucun paquet : du silence est injecté pour la durée écoulée, afin que les niveaux
-//! retombent. La sortie est revérifiée toutes les 2 s ; si elle change ou si une erreur
-//! survient, le flux est rouvert 1 s plus tard. Le fil est inscrit auprès de MMCSS
-//! (« Pro Audio ») pour être réveillé à l'heure même quand la machine est chargée.
+//! retombent. Le client est interrogé au moins toutes les 250 ms même sans paquet : une sortie
+//! invalidée (format changé, son spatial, mode exclusif, pilote relancé) se voit ainsi aussitôt.
+//! Un changement de sortie par défaut (signalé par Windows, revérifié toutes les 2 s) rouvre le
+//! flux tout de suite, sans pause ; après une erreur, il est rouvert 1 s plus tard. Le fil est
+//! inscrit auprès de MMCSS (« Pro Audio ») pour être réveillé à l'heure même quand la machine
+//! est chargée.
 //!
 //! Sortie écoutée ([`Sortie`]) : celle par défaut de Windows (ses changements sont suivis), ou
 //! une sortie précise choisie dans [`sorties`]. Si la sortie choisie disparaît (casque
@@ -38,25 +41,47 @@ pub trait Sink: Send + 'static {
     /// Après chaque réveil du fil (paquets lus ou délai écoulé). Renvoie le délai voulu avant le
     /// prochain réveil, s'il ne vient aucun paquet (borné entre 1 et 20 ms).
     fn tick(&mut self, now: Instant) -> Duration;
-    /// Le flux est perdu (erreur, sortie changée) ; un nouvel essai suit.
+    /// Le flux est perdu (erreur) ; un nouvel essai suit. Pas appelé quand la sortie écoutée
+    /// change (sortie par défaut, sortie choisie partie ou revenue) : [`Sink::open`] suit
+    /// aussitôt.
     fn lost(&mut self);
     /// Niveaux efficaces (RMS) des canaux gauche et droit du paquet qui vient d'être remis à
     /// [`Sink::samples`] : de quel côté joue le son. Rien par défaut.
     fn stereo(&mut self, _gauche: f32, _droite: f32) {}
+    /// Écoute par application ([`Ecoute::Applis`]) : `true` quand Windows la refuse et que toute
+    /// la sortie par défaut est écoutée à la place (repli), `false` quand elle reprend. Appelé à
+    /// chaque changement d'état seulement. Rien par défaut.
+    fn repli(&mut self, _actif: bool) {}
 }
 
-/// Capture en cours ; l'arrêter = la `drop` (au plus ~20 ms d'attente).
+/// Capture en cours ; l'arrêter = la `drop` : au plus ~300 ms d'attente, au-delà le fil est
+/// laissé finir seul (il s'arrête à son prochain réveil).
 pub struct Capture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// Attente au plus de la fin du fil de capture quand elle est lâchée.
+const ARRET_MAX: Duration = Duration::from_millis(300);
+
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(t) = self.thread.take() else { return };
+        let debut = Instant::now();
+        while !t.is_finished() {
+            if debut.elapsed() >= ARRET_MAX {
+                // Appel Windows bloqué (activation, pilote) : ne pas figer l'appelant.
+                log::warn!(
+                    "audio : fil de capture « {} » toujours actif après {} ms, laissé finir seul",
+                    t.thread().name().unwrap_or("?"),
+                    ARRET_MAX.as_millis()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
+        let _ = t.join();
     }
 }
 
@@ -163,8 +188,10 @@ pub fn start_sur(name: &str, sortie: Sortie, sink: impl Sink) -> std::io::Result
 
 /// Lance l'écoute de `ecoute` dans un fil nommé `name`. Pour [`Ecoute::Applis`] : fréquence
 /// fixe de 48 000 Hz (Windows convertit), son des applis additionné ; si Windows refuse la
-/// capture par application (version antérieure à Windows 10 2004, activation refusée), une
-/// ligne de journal et toute la sortie par défaut est écoutée à la place, jusqu'à l'arrêt.
+/// capture par application, une ligne de journal et toute la sortie par défaut est écoutée à la
+/// place ([`Sink::repli`]) : jusqu'à l'arrêt si elle n'est pas prise en charge (version
+/// antérieure à Windows 10 2004), sinon (refus passager) la capture par application est
+/// réessayée toutes les 30 s.
 pub fn start_ecoute(name: &str, ecoute: Ecoute, sink: impl Sink) -> std::io::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
@@ -185,6 +212,10 @@ const DEVICE_CHECK: Duration = Duration::from_secs(2);
 const MAX_WAIT_MS: u128 = 20;
 /// Erreurs répétées : une ligne de journal toutes les 30 s au plus.
 const ERROR_LOG: Duration = Duration::from_secs(30);
+/// Sans paquet, le client est interrogé au moins à ce rythme (sortie invalidée).
+const SONDE: Duration = Duration::from_millis(250);
+/// Repli passager sur la sortie par défaut : nouvel essai de la capture par application.
+const REPLI_ESSAI: Duration = Duration::from_secs(30);
 
 fn run(mut sink: impl Sink, ecoute: &Ecoute, stop: &AtomicBool) {
     if wasapi::initialize_mta().is_err() {
@@ -192,50 +223,105 @@ fn run(mut sink: impl Sink, ecoute: &Ecoute, stop: &AtomicBool) {
     }
     let mmcss = Mmcss::register();
     match ecoute {
-        Ecoute::Sortie(sortie) => ecouter_sortie(&mut sink, sortie, stop),
-        Ecoute::Applis(noms) => {
-            if let Err(e) = applis::ecouter(&mut sink, noms, stop) {
-                log::warn!(
-                    "audio : capture par application impossible ({e:#}), toute la sortie par                      défaut est écoutée"
-                );
-                sink.lost();
-                ecouter_sortie(&mut sink, &Sortie::ParDefaut, stop);
-            }
-        }
+        Ecoute::Sortie(sortie) => ecouter_sortie(&mut sink, sortie, stop, None),
+        Ecoute::Applis(noms) => ecouter_applis(&mut sink, noms, stop),
     }
     drop(mmcss);
     wasapi::deinitialize();
 }
 
-/// Écoute toute une sortie jusqu'à l'arrêt, en relançant le flux après chaque erreur.
-fn ecouter_sortie(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) {
+/// Écoute les applis `noms` jusqu'à l'arrêt. Si Windows refuse la capture par application :
+/// toute la sortie par défaut, pour de bon si elle n'est pas prise en charge, sinon 30 s avant
+/// un nouvel essai.
+fn ecouter_applis(sink: &mut impl Sink, noms: &[String], stop: &AtomicBool) {
+    let mut en_repli = false;
+    while !stop.load(Ordering::Relaxed) {
+        // `Ok` : arrêt demandé (après avoir signalé la fin du repli, s'il y en avait un).
+        let Err(e) = applis::ecouter(sink, noms, stop, en_repli) else {
+            break;
+        };
+        let definitif = applis::non_prise_en_charge(&e);
+        if !en_repli {
+            let suite = if definitif {
+                "non prise en charge par cette version de Windows"
+            } else {
+                "nouvel essai toutes les 30 s"
+            };
+            log::warn!(
+                "audio : capture par application impossible ({e:#}), toute la sortie par défaut \
+                 est écoutée ; {suite}"
+            );
+            en_repli = true;
+            sink.lost();
+            sink.repli(true);
+        } else {
+            log::debug!("audio : capture par application toujours impossible ({e:#})");
+        }
+        if definitif {
+            ecouter_sortie(sink, &Sortie::ParDefaut, stop, None);
+            break;
+        }
+        ecouter_sortie(
+            sink,
+            &Sortie::ParDefaut,
+            stop,
+            Some(Instant::now() + REPLI_ESSAI),
+        );
+    }
+}
+
+/// Écoute toute une sortie jusqu'à l'arrêt (ou jusqu'à `echeance`), en relançant le flux après
+/// chaque erreur ou changement de sortie.
+fn ecouter_sortie(
+    sink: &mut impl Sink,
+    sortie: &Sortie,
+    stop: &AtomicBool,
+    echeance: Option<Instant>,
+) {
+    let fini = || stop.load(Ordering::Relaxed) || echeance.is_some_and(|t| Instant::now() >= t);
     let mut last_error_log: Option<Instant> = None;
     let mut hidden = 0u32;
-    while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = stream(sink, sortie, stop) {
-            let now = Instant::now();
-            if last_error_log.is_none_or(|t| now.duration_since(t) >= ERROR_LOG) {
-                let masked = if hidden > 0 {
-                    format!(" ({hidden} masquées)")
-                } else {
-                    String::new()
-                };
-                log::warn!("audio : capture interrompue : {e:#}{masked}, nouvel essai");
-                last_error_log = Some(now);
-                hidden = 0;
-            } else {
-                hidden += 1;
+    while !fini() {
+        match stream(sink, sortie, &fini) {
+            Ok(Fin::Arret) => {}
+            Ok(Fin::Relancer(raison)) => {
+                // Pas une panne : rouvert aussitôt, sans perte annoncée.
+                log::info!("audio : {raison}, flux rouvert");
             }
-            sink.lost();
-            // Attente découpée pour rester réactif à l'arrêt.
-            for _ in 0..50 {
-                if stop.load(Ordering::Relaxed) {
-                    break;
+            Err(e) => {
+                let now = Instant::now();
+                if last_error_log.is_none_or(|t| now.duration_since(t) >= ERROR_LOG) {
+                    let masked = if hidden > 0 {
+                        format!(" ({hidden} masquées)")
+                    } else {
+                        String::new()
+                    };
+                    log::warn!("audio : capture interrompue : {e:#}{masked}, nouvel essai");
+                    last_error_log = Some(now);
+                    hidden = 0;
+                } else {
+                    hidden += 1;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                sink.lost();
+                // Attente découpée pour rester réactif à l'arrêt.
+                for _ in 0..50 {
+                    if fini() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
     }
+}
+
+/// Fin d'une session de capture sans erreur.
+#[derive(Debug, PartialEq, Eq)]
+enum Fin {
+    /// Arrêt demandé (ou échéance atteinte).
+    Arret,
+    /// La sortie à écouter a changé : rouvrir aussitôt, ce n'est pas une panne.
+    Relancer(&'static str),
 }
 
 /// La sortie `id` existe-t-elle et est-elle active ?
@@ -267,8 +353,9 @@ fn suivi<'a>(sortie: &'a Sortie, choisie_active: impl FnOnce(&str) -> bool) -> S
     }
 }
 
-/// Une session de capture. `Ok` = arrêt demandé ; `Err` = à relancer.
-fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::Result<()> {
+/// Une session de capture. `Ok` : arrêt demandé, ou sortie changée (à rouvrir aussitôt) ;
+/// `Err` : panne, à rouvrir après une pause.
+fn stream(sink: &mut impl Sink, sortie: &Sortie, fini: &impl Fn() -> bool) -> anyhow::Result<Fin> {
     let enumerator = DeviceEnumerator::new()?;
     let suivi = suivi(sortie, |id| active(&enumerator, id));
     let device = match suivi {
@@ -276,6 +363,13 @@ fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::R
         Suivi::Defaut { .. } => enumerator.get_default_device(&Direction::Render)?,
     };
     let device_id = device.get_id()?;
+    // Sortie par défaut suivie : Windows signale son changement aussitôt (la vérification
+    // toutes les 2 s reste en secours si l'inscription échoue).
+    let defaut_change = Arc::new(AtomicBool::new(false));
+    let _avis = match suivi {
+        Suivi::Defaut { .. } => avis_sortie_par_defaut(&enumerator, &defaut_change),
+        Suivi::Choisie(_) => None,
+    };
     let mut client = device.get_iaudioclient()?;
     let sample_rate = client.get_mixformat()?.get_samplespersec();
     let format = WaveFormat::new(32, 32, &SampleType::Float, sample_rate as usize, 2, None);
@@ -311,11 +405,15 @@ fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::R
     );
 
     let mut last_data = Instant::now();
+    let mut sonde = Instant::now();
     let mut device_checked = Instant::now();
     let mut wait = Duration::from_millis(10);
     let result = loop {
-        if stop.load(Ordering::Relaxed) {
-            break Ok(());
+        if fini() {
+            break Ok(Fin::Arret);
+        }
+        if defaut_change.load(Ordering::Relaxed) {
+            break Ok(Fin::Relancer("sortie son par défaut changée"));
         }
         let wait_ms = wait.as_millis().clamp(1, MAX_WAIT_MS) as u32;
         // Délai dépassé = pas de paquet (rien n'est joué) : ce n'est pas une erreur.
@@ -324,7 +422,16 @@ fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::R
                 break Err(e);
             }
             last_data = Instant::now();
+            sonde = last_data;
         } else {
+            // Une sortie invalidée (format changé, son spatial, mode exclusif, pilote relancé)
+            // n'envoie plus rien : seul le client le dit.
+            if sonde.elapsed() >= SONDE {
+                sonde = Instant::now();
+                if let Err(e) = capture.get_next_packet_size() {
+                    break Err(anyhow::Error::from(e).context("sortie invalidée"));
+                }
+            }
             let silent_for = last_data.elapsed();
             if silent_for > NO_DATA {
                 let n = (silent_for.as_secs_f64() * f64::from(sample_rate)) as usize;
@@ -339,18 +446,24 @@ fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::R
             match suivi {
                 Suivi::Choisie(id) => {
                     if !active(&enumerator, id) {
-                        break Err(anyhow::anyhow!("sortie choisie disparue"));
+                        break Ok(Fin::Relancer("sortie choisie disparue"));
                     }
                 }
                 Suivi::Defaut { choisie_absente } => {
                     if choisie_absente.is_some_and(|id| active(&enumerator, id)) {
-                        break Err(anyhow::anyhow!("sortie choisie de nouveau active"));
+                        break Ok(Fin::Relancer("sortie choisie de nouveau active"));
                     }
-                    let current = enumerator
+                    match enumerator
                         .get_default_device(&Direction::Render)
-                        .and_then(|d| d.get_id());
-                    if current.as_deref().ok() != Some(device_id.as_str()) {
-                        break Err(anyhow::anyhow!("sortie son par défaut changée"));
+                        .and_then(|d| d.get_id())
+                    {
+                        Ok(id) if id != device_id => {
+                            break Ok(Fin::Relancer("sortie son par défaut changée"));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            break Err(anyhow::Error::from(e).context("plus de sortie par défaut"))
+                        }
                     }
                 }
             }
@@ -358,6 +471,26 @@ fn stream(sink: &mut impl Sink, sortie: &Sortie, stop: &AtomicBool) -> anyhow::R
     };
     let _ = client.stop_stream();
     result
+}
+
+/// Inscription auprès de Windows : `change` passe à `true` quand la sortie son par défaut
+/// (rôle « console », celle qu'ouvre [`stream`]) change. `None` si Windows la refuse.
+fn avis_sortie_par_defaut(
+    enumerator: &DeviceEnumerator,
+    change: &Arc<AtomicBool>,
+) -> Option<wasapi::DeviceEventRegistration> {
+    let mut rappels = wasapi::DeviceEventCallbacks::new();
+    let c = change.clone();
+    // Appelé dans un fil de Windows : ne fait que lever le drapeau.
+    rappels.set_default_device_callback(move |direction, role, _id| {
+        if direction == Direction::Render && role == wasapi::Role::Console {
+            c.store(true, Ordering::Relaxed);
+        }
+    });
+    enumerator
+        .register_notification_callback(rappels)
+        .inspect_err(|e| log::debug!("audio : changements de sortie non signalés ({e})"))
+        .ok()
 }
 
 /// Vide les paquets disponibles (mélange mono L+R).
@@ -442,7 +575,43 @@ impl Drop for Mmcss {
 
 #[cfg(test)]
 mod tests {
-    use super::{mix_mono, suivi, Ecoute, Sortie, Suivi};
+    use super::{mix_mono, suivi, Capture, Ecoute, Sortie, Suivi, ARRET_MAX};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Capture factice dont le fil met `duree` à voir l'arrêt.
+    fn capture_lente(duree: Duration) -> Capture {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let debut = Instant::now();
+            while !s.load(Ordering::Relaxed) || debut.elapsed() < duree {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Capture {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn arret_borne_meme_si_le_fil_est_bloque() {
+        // fil qui s'arrête vite : attendu jusqu'au bout
+        let debut = Instant::now();
+        drop(capture_lente(Duration::ZERO));
+        assert!(debut.elapsed() < ARRET_MAX);
+        // fil bloqué 3 s : lâché après ~300 ms
+        let debut = Instant::now();
+        drop(capture_lente(Duration::from_secs(3)));
+        let attente = debut.elapsed();
+        assert!(attente >= ARRET_MAX, "{attente:?}");
+        assert!(
+            attente < ARRET_MAX + Duration::from_millis(200),
+            "{attente:?}"
+        );
+    }
 
     /// Essai sur les vraies sorties de la machine :
     /// `cargo test --release sorties_reelles -- --ignored --nocapture`.

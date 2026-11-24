@@ -44,13 +44,21 @@ sorties actives, `(identifiant, nom affiché)`, et `Sortie::depuis_id("")` donne
 pour un réglage vide). Si la sortie choisie disparaît, la capture se replie sur la sortie par défaut et revient
 sur la choisie dès qu'elle est de nouveau active (vérification toutes les 2 s, comme la sortie par défaut).
 
+Changer de sortie n'est pas une panne : un changement de sortie par défaut (signalé aussitôt par Windows,
+`register_notification_callback`, la vérification des 2 s restant en secours) ou le départ et le retour de la
+sortie choisie rouvrent le flux tout de suite, sans pause ni `lost()`. `lost()` ne sert qu'aux erreurs. Sans
+paquet, le client est interrogé toutes les 250 ms : une sortie reconfigurée (format, son spatial, mode exclusif,
+pilote relancé) invalide le client et la capture est rouverte. `Capture::drop` attend le fil au plus 300 ms,
+puis le détache (une ligne de journal) : l'appelant ne reste jamais bloqué.
+
 ## Son de certaines applications (`capture`, 0.7.0)
 
 `capture::start_ecoute(nom, ecoute, sink)` lance la capture d'une `Ecoute` : `Ecoute::Sortie(sortie)` (tout le
 mélange, comme `start_sur`, qui passe désormais par là sans changer de comportement) ou
 `Ecoute::Applis(vec!["spotify.exe".into(), "chrome.exe".into()])`, le son de ces applications seulement, quelle
 que soit la sortie où elles jouent (capture « process loopback » de Windows 10 2004 et suivants). Mêmes appels
-au `Sink` (`open`, `samples` en mono, `stereo`, `silence`, `tick`, `lost`), même MMCSS.
+au `Sink` (`open`, `samples` en mono, `stereo`, `silence`, `tick`, `lost`, et `repli`, qui ne fait rien par
+défaut), même MMCSS.
 `Ecoute::depuis_reglages(sortie_id, &applis)` donne `Applis` si la liste contient un nom, sinon toute la sortie
 (`Sortie::depuis_id`) : aucune appli cochée = tout le son.
 
@@ -67,10 +75,12 @@ au `Sink` (`open`, `samples` en mono, `stereo`, `silence`, `tick`, `lost`), mêm
   sortie entière. Les ouvertures prennent 10 ms au plus par tour de boucle (la suite au tour suivant), pour que le
   son des applis déjà ouvertes continue de passer ; au-delà de 64 clients, les suivants sont lus à chaque réveil
   sans être attendus.
-- **Repli** : au lancement, un essai de capture sur le processus appelant dit si Windows sait faire. S'il refuse
-  (Windows trop ancien, activation refusée) : une ligne de journal, `lost()`, puis toute la sortie par défaut
-  jusqu'à l'arrêt de la capture. Un processus précis que Windows refuse (protégé) : une ligne de journal, il est
-  ignoré tant qu'il tourne, les autres sont écoutés.
+- **Repli** : au lancement, un essai de capture sur le processus appelant dit si Windows sait faire. S'il ne
+  connaît pas cette capture (Windows trop ancien : `E_NOTIMPL`, `E_NOINTERFACE`, classe non enregistrée, non pris
+  en charge) : une ligne de journal, puis toute la sortie par défaut jusqu'à l'arrêt de la capture. Tout autre
+  refus (service audio pas encore prêt, relancé) : la sortie par défaut pendant 30 s, puis un nouvel essai. Le
+  `Sink` est prévenu par `repli(true)` et `repli(false)`. Un processus précis que Windows refuse (protégé) : une
+  ligne de journal, il est réessayé après 30 s, 60 s, 120 s… (10 min au plus), les autres sont écoutés.
 
 `capture::applis_sonores()` liste les applications qui ont en ce moment une session audio sur une sortie active,
 `(exécutable, nom affichable)` : sans les sons système (pid 0, programmes de `System32` et `SysWOW64`, processus d'un autre compte

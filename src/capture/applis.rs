@@ -144,7 +144,10 @@ fn de_windows(chemin: &str, racine: &str) -> bool {
 fn ranger(applis: Vec<AppliSonore>) -> Vec<AppliSonore> {
     let mut liste: Vec<AppliSonore> = Vec::new();
     for a in applis {
-        match liste.iter_mut().find(|x| normaliser(&x.exe) == normaliser(&a.exe)) {
+        match liste
+            .iter_mut()
+            .find(|x| normaliser(&x.exe) == normaliser(&a.exe))
+        {
             Some(x) => x.joue |= a.joue,
             None => liste.push(a),
         }
@@ -449,14 +452,21 @@ impl Drop for Client {
 }
 
 /// Écoute les applis `noms` jusqu'à l'arrêt (`Ok`). `Err` : Windows refuse la capture par
-/// application (essai sur ce processus-ci), à remplacer par toute la sortie.
+/// application (essai sur ce processus-ci), à remplacer par toute la sortie ; voir
+/// [`non_prise_en_charge`] pour savoir s'il faut la réessayer. `en_repli` : la sortie entière
+/// était écoutée à la place, la fin du repli est signalée au `Sink` dès l'essai réussi.
 pub(super) fn ecouter(
     sink: &mut impl Sink,
     noms: &[String],
     stop: &AtomicBool,
+    en_repli: bool,
 ) -> anyhow::Result<()> {
     // Windows antérieur à 10 2004, ou capture refusée : on le sait avant d'attendre une appli.
     Client::ouvrir(std::process::id(), "essai")?;
+    if en_repli {
+        log::info!("audio : capture par application rétablie");
+        sink.repli(false);
+    }
     let mut voulus: Vec<String> = Vec::new();
     for n in noms.iter().map(|n| normaliser(n)) {
         if n != ".exe" && !voulus.contains(&n) {
@@ -531,16 +541,57 @@ pub(super) fn ecouter(
     Ok(())
 }
 
+/// Codes d'erreur (HRESULT) qui disent que Windows ne connaît pas la capture par application
+/// (antérieur à Windows 10 2004) : inutile de la réessayer. Tout autre refus est jugé passager.
+const NON_PRIS_EN_CHARGE: [u32; 5] = [
+    0x8000_4001, // E_NOTIMPL
+    0x8000_4002, // E_NOINTERFACE
+    0x8004_0154, // REGDB_E_CLASSNOTREG
+    0x8007_0032, // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+    0x8007_0078, // HRESULT_FROM_WIN32(ERROR_CALL_NOT_IMPLEMENTED)
+];
+
+/// Le refus de [`ecouter`] vient-il de ce que Windows ne prend pas en charge la capture par
+/// application (repli définitif) ? Sinon, refus passager : à réessayer.
+pub(super) fn non_prise_en_charge(e: &anyhow::Error) -> bool {
+    e.chain()
+        .find_map(|c| match c.downcast_ref::<wasapi::WasapiError>()? {
+            wasapi::WasapiError::Windows(w) => Some(w.code().0),
+            _ => None,
+        })
+        .is_some_and(code_non_pris_en_charge)
+}
+
+fn code_non_pris_en_charge(code: i32) -> bool {
+    NON_PRIS_EN_CHARGE.contains(&(code as u32))
+}
+
 /// Temps d'ouverture de clients par tour de boucle : au-delà, la suite attend le tour suivant
 /// (le son des clients déjà ouverts continue de passer).
 const BUDGET_OUVERTURE: Duration = Duration::from_millis(10);
 
-/// Clients ouverts, et processus que Windows refuse de laisser capturer (pas réessayés tant
-/// qu'ils tournent).
+/// Délai avant de réessayer un processus refusé `essais` fois de suite : 30 s, puis le double à
+/// chaque refus, 10 min au plus.
+fn delai_refus(essais: u32) -> Duration {
+    const PREMIER: u64 = 30;
+    const MAX: u64 = 600;
+    let puissance = essais.saturating_sub(1).min(16);
+    Duration::from_secs((PREMIER << puissance).min(MAX))
+}
+
+/// Processus que Windows a refusé de laisser capturer : réessayé à `prochain`.
+struct Refus {
+    pid: u32,
+    essais: u32,
+    prochain: Instant,
+}
+
+/// Clients ouverts, et processus que Windows refuse de laisser capturer (réessayés de plus en
+/// plus rarement tant qu'ils tournent).
 #[derive(Default)]
 struct Suivi {
     clients: Vec<Client>,
-    refuses: Vec<u32>,
+    refuses: Vec<Refus>,
 }
 
 impl Suivi {
@@ -564,7 +615,7 @@ impl Suivi {
             })
             .collect();
         self.refuses
-            .retain(|pid| cibles.iter().any(|&(p, _)| p == *pid));
+            .retain(|r| cibles.iter().any(|&(p, _)| p == r.pid));
         self.clients.retain(|c| {
             let garde = cibles.iter().any(|&(pid, _)| pid == c.pid);
             if !garde {
@@ -574,7 +625,10 @@ impl Suivi {
             garde
         });
         for (pid, nom) in cibles {
-            if self.clients.iter().any(|c| c.pid == pid) || self.refuses.contains(&pid) {
+            let refus = self.refuses.iter().position(|r| r.pid == pid);
+            if self.clients.iter().any(|c| c.pid == pid)
+                || refus.is_some_and(|i| debut < self.refuses[i].prochain)
+            {
                 continue;
             }
             if debut.elapsed() >= BUDGET_OUVERTURE {
@@ -585,10 +639,27 @@ impl Suivi {
                     log::info!("audio : « {nom} » ({pid}) écoutée");
                     melange.ajouter(pid);
                     self.clients.push(c);
+                    if let Some(i) = refus {
+                        self.refuses.swap_remove(i);
+                    }
                 }
                 Err(e) => {
-                    log::warn!("audio : « {nom} » ({pid}) ne peut pas être écoutée : {e:#}");
-                    self.refuses.push(pid);
+                    let essais = refus.map_or(0, |i| self.refuses[i].essais) + 1;
+                    let delai = delai_refus(essais);
+                    let r = Refus {
+                        pid,
+                        essais,
+                        prochain: Instant::now() + delai,
+                    };
+                    match refus {
+                        Some(i) => self.refuses[i] = r,
+                        None => self.refuses.push(r),
+                    }
+                    log::warn!(
+                        "audio : « {nom} » ({pid}) ne peut pas être écoutée : {e:#} ; nouvel \
+                         essai dans {} s",
+                        delai.as_secs()
+                    );
                 }
             }
         }
@@ -611,12 +682,46 @@ fn remettre(sink: &mut impl Sink, somme: &[[f32; 2]], mono: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        de_windows, nom_affichable, AppliSonore, normaliser, racines, ranger, Melange, Processus, RETARD_MAX,
+        de_windows, delai_refus, nom_affichable, non_prise_en_charge, normaliser, racines, ranger,
+        AppliSonore, Melange, Processus, RETARD_MAX,
     };
     use std::time::{Duration, Instant};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn refus_reessayes_de_plus_en_plus_rarement() {
+        let s = |n: u32| delai_refus(n).as_secs();
+        assert_eq!([s(1), s(2), s(3), s(4), s(5)], [30, 60, 120, 240, 480]);
+        // 10 min au plus, même après de très nombreux refus
+        assert_eq!([s(6), s(7), s(100), s(u32::MAX)], [600; 4]);
+        assert_eq!(s(0), 30);
+    }
+
+    #[test]
+    fn repli_definitif_seulement_si_windows_ne_connait_pas_la_capture() {
+        let erreur = |code: u32| {
+            let w = windows::core::Error::from(windows::core::HRESULT(code as i32));
+            anyhow::Error::from(wasapi::WasapiError::Windows(w))
+        };
+        // classe non enregistrée, non implémenté, interface inconnue : Windows trop ancien
+        for code in [0x8004_0154, 0x8000_4001, 0x8000_4002, 0x8007_0032] {
+            assert!(non_prise_en_charge(&erreur(code)), "{code:#x}");
+            assert!(
+                non_prise_en_charge(&erreur(code).context("essai")),
+                "{code:#x} enrobée"
+            );
+        }
+        // accès refusé, appareil invalidé, service audio arrêté : passager
+        for code in [0x8007_0005, 0x8889_0004, 0x8889_0010] {
+            assert!(!non_prise_en_charge(&erreur(code)), "{code:#x}");
+        }
+        assert!(!non_prise_en_charge(&anyhow::anyhow!("autre")));
+        assert!(!non_prise_en_charge(&anyhow::Error::from(
+            wasapi::WasapiError::ClientNotInit
+        )));
     }
 
     #[test]
