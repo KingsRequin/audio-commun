@@ -49,7 +49,13 @@ Changer de sortie n'est pas une panne : un changement de sortie par défaut (sig
 sortie choisie rouvrent le flux tout de suite, sans pause ni `lost()`. `lost()` ne sert qu'aux erreurs. Sans
 paquet, le client est interrogé toutes les 250 ms : une sortie reconfigurée (format, son spatial, mode exclusif,
 pilote relancé) invalide le client et la capture est rouverte. `Capture::drop` attend le fil au plus 300 ms,
-puis le détache (une ligne de journal) : l'appelant ne reste jamais bloqué.
+puis le détache (une ligne de journal) : l'appelant ne reste jamais bloqué. Un fil détaché peut encore appeler
+son `Sink` un moment : si une nouvelle capture écrit au même endroit, au `Sink` de reconnaître qu'il n'est plus
+le bon (Essaim lui donne un numéro de génération).
+
+Une panique dans le fil de capture (dans le `Sink` ou la capture) est rattrapée : une ligne de journal,
+`lost()`, puis le fil se termine. `Capture::actif()` passe alors à `false` : à l'application de relancer la
+capture.
 
 ## Son de certaines applications (`capture`, 0.7.0)
 
@@ -78,9 +84,13 @@ défaut), même MMCSS.
 - **Repli** : au lancement, un essai de capture sur le processus appelant dit si Windows sait faire. S'il ne
   connaît pas cette capture (Windows trop ancien : `E_NOTIMPL`, `E_NOINTERFACE`, classe non enregistrée, non pris
   en charge) : une ligne de journal, puis toute la sortie par défaut jusqu'à l'arrêt de la capture. Tout autre
-  refus (service audio pas encore prêt, relancé) : la sortie par défaut pendant 30 s, puis un nouvel essai. Le
-  `Sink` est prévenu par `repli(true)` et `repli(false)`. Un processus précis que Windows refuse (protégé) : une
-  ligne de journal, il est réessayé après 30 s, 60 s, 120 s… (10 min au plus), les autres sont écoutés.
+  refus (service audio pas encore prêt, relancé) : la sortie par défaut, et un nouvel essai toutes les 30 s dans
+  un fil à part ; le flux de la sortie par défaut n'est quitté qu'une fois l'essai réussi (jusqu'à la 0.7.2, il
+  était fermé et rouvert toutes les 30 s, et `open` remettait l'analyse à zéro). Le `Sink` est prévenu par
+  `repli(true)` à l'entrée du repli et par `repli(false)` dès que la capture par application fonctionne, au
+  premier essai réussi même sans repli (l'état part toujours d'une valeur sûre). Un processus précis que Windows
+  refuse (protégé) : une ligne de journal, il est réessayé après 30 s, 60 s, 120 s… (10 min au plus), les autres
+  sont écoutés.
 
 `capture::applis_sonores()` liste les applications qui ont en ce moment une session audio sur une sortie active,
 `(exécutable, nom affichable)` : sans les sons système (pid 0, programmes de `System32` et `SysWOW64`, processus d'un autre compte

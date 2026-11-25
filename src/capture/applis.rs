@@ -451,22 +451,16 @@ impl Drop for Client {
     }
 }
 
-/// Écoute les applis `noms` jusqu'à l'arrêt (`Ok`). `Err` : Windows refuse la capture par
-/// application (essai sur ce processus-ci), à remplacer par toute la sortie ; voir
-/// [`non_prise_en_charge`] pour savoir s'il faut la réessayer. `en_repli` : la sortie entière
-/// était écoutée à la place, la fin du repli est signalée au `Sink` dès l'essai réussi.
-pub(super) fn ecouter(
-    sink: &mut impl Sink,
-    noms: &[String],
-    stop: &AtomicBool,
-    en_repli: bool,
-) -> anyhow::Result<()> {
-    // Windows antérieur à 10 2004, ou capture refusée : on le sait avant d'attendre une appli.
-    Client::ouvrir(std::process::id(), "essai")?;
-    if en_repli {
-        log::info!("audio : capture par application rétablie");
-        sink.repli(false);
-    }
+/// Windows accepte-t-il la capture par application ? Essai sur ce processus-ci (client ouvert
+/// puis aussitôt refermé) : on le sait avant d'attendre une appli. `Err` : Windows antérieur à
+/// 10 2004, ou capture refusée ; voir [`non_prise_en_charge`] pour savoir s'il faut réessayer.
+/// COM doit être initialisé sur le fil appelant.
+pub(super) fn essai() -> anyhow::Result<()> {
+    Client::ouvrir(std::process::id(), "essai").map(drop)
+}
+
+/// Écoute les applis `noms` jusqu'à l'arrêt (après un [`essai`] réussi).
+pub(super) fn ecouter(sink: &mut impl Sink, noms: &[String], stop: &AtomicBool) {
     let mut voulus: Vec<String> = Vec::new();
     for n in noms.iter().map(|n| normaliser(n)) {
         if n != ".exe" && !voulus.contains(&n) {
@@ -538,7 +532,6 @@ pub(super) fn ecouter(
         }
         wait = sink.tick(now);
     }
-    Ok(())
 }
 
 /// Codes d'erreur (HRESULT) qui disent que Windows ne connaît pas la capture par application

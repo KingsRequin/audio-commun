@@ -19,6 +19,9 @@
 //! Ou seulement le son de certaines applications ([`Ecoute::Applis`], [`start_ecoute`]) :
 //! capture « process loopback » de Windows 10 2004+, détaillée dans le module `applis` ;
 //! [`applis_sonores`] liste les applications qui ont une session audio.
+//!
+//! Une panique dans le fil est rattrapée : [`Sink::lost`], puis le fil se termine
+//! ([`Capture::actif`] le dit, à l'application de relancer la capture).
 
 mod applis;
 
@@ -49,8 +52,9 @@ pub trait Sink: Send + 'static {
     /// [`Sink::samples`] : de quel côté joue le son. Rien par défaut.
     fn stereo(&mut self, _gauche: f32, _droite: f32) {}
     /// Écoute par application ([`Ecoute::Applis`]) : `true` quand Windows la refuse et que toute
-    /// la sortie par défaut est écoutée à la place (repli), `false` quand elle reprend. Appelé à
-    /// chaque changement d'état seulement. Rien par défaut.
+    /// la sortie par défaut est écoutée à la place (repli), `false` dès que la capture par
+    /// application fonctionne (au premier essai réussi, repli ou non : l'état part toujours d'une
+    /// valeur sûre). Rien par défaut.
     fn repli(&mut self, _actif: bool) {}
 }
 
@@ -59,6 +63,14 @@ pub trait Sink: Send + 'static {
 pub struct Capture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+impl Capture {
+    /// Le fil de capture tourne-t-il encore ? `false` s'il s'est arrêté de lui-même (panique :
+    /// [`Sink::lost`] a été appelé, plus rien ne sera remis) : à relancer.
+    pub fn actif(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
 }
 
 /// Attente au plus de la fin du fil de capture quand elle est lâchée.
@@ -191,7 +203,11 @@ pub fn start_sur(name: &str, sortie: Sortie, sink: impl Sink) -> std::io::Result
 /// capture par application, une ligne de journal et toute la sortie par défaut est écoutée à la
 /// place ([`Sink::repli`]) : jusqu'à l'arrêt si elle n'est pas prise en charge (version
 /// antérieure à Windows 10 2004), sinon (refus passager) la capture par application est
-/// réessayée toutes les 30 s.
+/// réessayée toutes les 30 s dans un fil à part, sans couper le flux de la sortie par défaut, qui
+/// n'est quitté qu'une fois l'essai réussi.
+///
+/// Une panique dans le fil (dans le `Sink` ou la capture) est rattrapée : [`Sink::lost`] est
+/// appelé et le fil se termine ([`Capture::actif`] passe à `false`).
 pub fn start_ecoute(name: &str, ecoute: Ecoute, sink: impl Sink) -> std::io::Result<Capture> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
@@ -214,7 +230,8 @@ const MAX_WAIT_MS: u128 = 20;
 const ERROR_LOG: Duration = Duration::from_secs(30);
 /// Sans paquet, le client est interrogé au moins à ce rythme (sortie invalidée).
 const SONDE: Duration = Duration::from_millis(250);
-/// Repli passager sur la sortie par défaut : nouvel essai de la capture par application.
+/// Repli passager sur la sortie par défaut : intervalle entre deux essais de la capture par
+/// application (faits sans quitter la sortie par défaut).
 const REPLI_ESSAI: Duration = Duration::from_secs(30);
 
 fn run(mut sink: impl Sink, ecoute: &Ecoute, stop: &AtomicBool) {
@@ -222,67 +239,163 @@ fn run(mut sink: impl Sink, ecoute: &Ecoute, stop: &AtomicBool) {
         log::warn!("audio : initialisation COM impossible");
     }
     let mmcss = Mmcss::register();
-    match ecoute {
-        Ecoute::Sortie(sortie) => ecouter_sortie(&mut sink, sortie, stop, None),
-        Ecoute::Applis(noms) => ecouter_applis(&mut sink, noms, stop),
-    }
+    sans_panique(&mut sink, |sink| match ecoute {
+        Ecoute::Sortie(sortie) => ecouter_sortie(sink, sortie, stop, None),
+        Ecoute::Applis(noms) => ecouter_applis(
+            sink,
+            stop,
+            applis::essai(),
+            |sink, retour| ecouter_sortie(sink, &Sortie::ParDefaut, stop, retour),
+            |sink| applis::ecouter(sink, noms, stop),
+        ),
+    });
     drop(mmcss);
     wasapi::deinitialize();
 }
 
-/// Écoute les applis `noms` jusqu'à l'arrêt. Si Windows refuse la capture par application :
-/// toute la sortie par défaut, pour de bon si elle n'est pas prise en charge, sinon 30 s avant
-/// un nouvel essai.
-fn ecouter_applis(sink: &mut impl Sink, noms: &[String], stop: &AtomicBool) {
-    let mut en_repli = false;
-    while !stop.load(Ordering::Relaxed) {
-        // `Ok` : arrêt demandé (après avoir signalé la fin du repli, s'il y en avait un).
-        let Err(e) = applis::ecouter(sink, noms, stop, en_repli) else {
-            break;
-        };
+/// Lance `f` ; s'il panique, le `Sink` apprend que le flux est perdu ([`Sink::lost`]) et le fil
+/// pourra se terminer (le message est déjà passé par le crochet de panique). Renvoie `false`
+/// après une panique.
+fn sans_panique<S: Sink>(sink: &mut S, f: impl FnOnce(&mut S)) -> bool {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if catch_unwind(AssertUnwindSafe(|| f(&mut *sink))).is_ok() {
+        return true;
+    }
+    log::error!("audio : le fil de capture a planté, capture arrêtée");
+    // Le `Sink` peut être dans un état incohérent : une seconde panique ne doit pas sortir.
+    if catch_unwind(AssertUnwindSafe(|| sink.lost())).is_err() {
+        log::error!("audio : `lost` a planté à son tour");
+    }
+    false
+}
+
+/// Écoute par application. `essai` : réponse de Windows à un premier essai de capture par
+/// application ; `sortie` écoute toute la sortie par défaut (repli) jusqu'à l'arrêt, ou jusqu'à ce
+/// que l'essai périodique qu'on lui donne réussisse ; `applis` écoute les applis jusqu'à l'arrêt.
+/// Si Windows refuse : toute la sortie par défaut, pour de bon si la capture par application
+/// n'est pas prise en charge, sinon jusqu'à ce qu'un essai (toutes les 30 s, dans un fil à part)
+/// réussisse.
+fn ecouter_applis<S: Sink>(
+    sink: &mut S,
+    stop: &AtomicBool,
+    essai: anyhow::Result<()>,
+    sortie: impl FnOnce(&mut S, Option<&mut EssaiApplis>),
+    applis: impl FnOnce(&mut S),
+) {
+    if let Err(e) = essai {
         let definitif = applis::non_prise_en_charge(&e);
-        if !en_repli {
-            let suite = if definitif {
-                "non prise en charge par cette version de Windows"
-            } else {
-                "nouvel essai toutes les 30 s"
-            };
-            log::warn!(
-                "audio : capture par application impossible ({e:#}), toute la sortie par défaut \
-                 est écoutée ; {suite}"
-            );
-            en_repli = true;
-            sink.lost();
-            sink.repli(true);
+        let suite = if definitif {
+            "non prise en charge par cette version de Windows"
         } else {
-            log::debug!("audio : capture par application toujours impossible ({e:#})");
-        }
-        if definitif {
-            ecouter_sortie(sink, &Sortie::ParDefaut, stop, None);
-            break;
-        }
-        ecouter_sortie(
-            sink,
-            &Sortie::ParDefaut,
-            stop,
-            Some(Instant::now() + REPLI_ESSAI),
+            "nouvel essai toutes les 30 s"
+        };
+        log::warn!(
+            "audio : capture par application impossible ({e:#}), toute la sortie par défaut est \
+             écoutée ; {suite}"
         );
+        sink.lost();
+        sink.repli(true);
+        let mut retour = (!definitif).then(|| EssaiApplis::new(applis::essai, REPLI_ESSAI));
+        sortie(sink, retour.as_mut());
+        if stop.load(Ordering::Relaxed) || !retour.is_some_and(|r| r.reussi) {
+            return;
+        }
+        log::info!("audio : capture par application rétablie");
+    }
+    // Toujours, même sans repli dans ce fil : l'état annoncé part d'une valeur sûre.
+    sink.repli(false);
+    applis(sink);
+}
+
+/// Essai périodique de la capture par application pendant un repli, dans un fil à part :
+/// l'activation peut bloquer, et le son de la sortie par défaut doit continuer de passer.
+struct EssaiApplis {
+    essai: fn() -> anyhow::Result<()>,
+    intervalle: Duration,
+    /// Prochain essai ; `None` : abandonné (Windows ne connaît pas cette capture).
+    prochain: Option<Instant>,
+    fil: Option<JoinHandle<anyhow::Result<()>>>,
+    /// Un essai a réussi : le repli peut prendre fin (reste vrai).
+    reussi: bool,
+}
+
+impl EssaiApplis {
+    fn new(essai: fn() -> anyhow::Result<()>, intervalle: Duration) -> Self {
+        Self {
+            essai,
+            intervalle,
+            prochain: Some(Instant::now() + intervalle),
+            fil: None,
+            reussi: false,
+        }
+    }
+
+    /// À appeler souvent : relève l'essai fini, lance le suivant quand il est temps. Vrai dès
+    /// qu'un essai a réussi.
+    fn avancer(&mut self, now: Instant) -> bool {
+        if self.reussi {
+            return true;
+        }
+        if let Some(fil) = self.fil.take_if(|f| f.is_finished()) {
+            match fil.join() {
+                Ok(Ok(())) => {
+                    self.reussi = true;
+                    return true;
+                }
+                Ok(Err(e)) if applis::non_prise_en_charge(&e) => {
+                    log::warn!("audio : capture par application non prise en charge ({e:#})");
+                    self.prochain = None;
+                }
+                Ok(Err(e)) => {
+                    log::debug!("audio : capture par application toujours impossible ({e:#})");
+                    self.prochain = Some(now + self.intervalle);
+                }
+                Err(_) => self.prochain = Some(now + self.intervalle),
+            }
+        }
+        if self.fil.is_none() && self.prochain.is_some_and(|t| now >= t) {
+            let essai = self.essai;
+            let lance = std::thread::Builder::new()
+                .name("audio-essai-applis".into())
+                .spawn(move || {
+                    let init = wasapi::initialize_mta();
+                    let r = essai();
+                    if init.is_ok() {
+                        wasapi::deinitialize();
+                    }
+                    r
+                });
+            match lance {
+                Ok(f) => self.fil = Some(f),
+                Err(e) => {
+                    log::debug!("audio : essai de capture par application non lancé ({e})");
+                    self.prochain = Some(now + self.intervalle);
+                }
+            }
+        }
+        false
     }
 }
 
-/// Écoute toute une sortie jusqu'à l'arrêt (ou jusqu'à `echeance`), en relançant le flux après
-/// chaque erreur ou changement de sortie.
+/// Écoute toute une sortie jusqu'à l'arrêt, en relançant le flux après chaque erreur ou
+/// changement de sortie. Avec `retour` (repli des applis) : aussi jusqu'à ce que l'essai de la
+/// capture par application réussisse, sans couper le flux en attendant.
 fn ecouter_sortie(
     sink: &mut impl Sink,
     sortie: &Sortie,
     stop: &AtomicBool,
-    echeance: Option<Instant>,
+    mut retour: Option<&mut EssaiApplis>,
 ) {
-    let fini = || stop.load(Ordering::Relaxed) || echeance.is_some_and(|t| Instant::now() >= t);
+    let mut fini = || {
+        stop.load(Ordering::Relaxed)
+            || retour
+                .as_deref_mut()
+                .is_some_and(|r| r.avancer(Instant::now()))
+    };
     let mut last_error_log: Option<Instant> = None;
     let mut hidden = 0u32;
     while !fini() {
-        match stream(sink, sortie, &fini) {
+        match stream(sink, sortie, &mut fini) {
             Ok(Fin::Arret) => {}
             Ok(Fin::Relancer(raison)) => {
                 // Pas une panne : rouvert aussitôt, sans perte annoncée.
@@ -318,7 +431,7 @@ fn ecouter_sortie(
 /// Fin d'une session de capture sans erreur.
 #[derive(Debug, PartialEq, Eq)]
 enum Fin {
-    /// Arrêt demandé (ou échéance atteinte).
+    /// Arrêt demandé (ou fin du repli des applis).
     Arret,
     /// La sortie à écouter a changé : rouvrir aussitôt, ce n'est pas une panne.
     Relancer(&'static str),
@@ -355,7 +468,11 @@ fn suivi<'a>(sortie: &'a Sortie, choisie_active: impl FnOnce(&str) -> bool) -> S
 
 /// Une session de capture. `Ok` : arrêt demandé, ou sortie changée (à rouvrir aussitôt) ;
 /// `Err` : panne, à rouvrir après une pause.
-fn stream(sink: &mut impl Sink, sortie: &Sortie, fini: &impl Fn() -> bool) -> anyhow::Result<Fin> {
+fn stream(
+    sink: &mut impl Sink,
+    sortie: &Sortie,
+    fini: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Fin> {
     let enumerator = DeviceEnumerator::new()?;
     let suivi = suivi(sortie, |id| active(&enumerator, id));
     let device = match suivi {
@@ -575,10 +692,158 @@ impl Drop for Mmcss {
 
 #[cfg(test)]
 mod tests {
-    use super::{mix_mono, suivi, Capture, Ecoute, Sortie, Suivi, ARRET_MAX};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{
+        ecouter_applis, mix_mono, sans_panique, suivi, Capture, Ecoute, EssaiApplis, Sink, Sortie,
+        Suivi, ARRET_MAX,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// `Sink` qui note les appels qui comptent pour l'état (ouverture, perte, repli).
+    #[derive(Default)]
+    struct Journal(Vec<String>);
+
+    impl Sink for Journal {
+        fn open(&mut self, fs: u32) {
+            self.0.push(format!("open {fs}"));
+        }
+        fn samples(&mut self, _: &[f32]) {}
+        fn silence(&mut self, _: usize) {}
+        fn tick(&mut self, _: Instant) -> Duration {
+            Duration::from_millis(10)
+        }
+        fn lost(&mut self) {
+            self.0.push("lost".into());
+        }
+        fn repli(&mut self, actif: bool) {
+            self.0.push(format!("repli {actif}"));
+        }
+    }
+
+    fn refus(code: u32) -> anyhow::Error {
+        let w = windows::core::Error::from(windows::core::HRESULT(code as i32));
+        anyhow::Error::from(wasapi::WasapiError::Windows(w))
+    }
+    /// Accès refusé (passager) et classe non enregistrée (Windows trop ancien).
+    const PASSAGER: u32 = 0x8007_0005;
+    const DEFINITIF: u32 = 0x8004_0154;
+
+    #[test]
+    fn repli_leve_et_baisse_au_premier_essai_reussi() {
+        let stop = AtomicBool::new(false);
+        // essai réussi d'emblée : `repli(false)` quand même, puis les applis
+        let mut j = Journal::default();
+        let mut applis = false;
+        ecouter_applis(
+            &mut j,
+            &stop,
+            Ok(()),
+            |_, _| panic!("pas de repli"),
+            |_| applis = true,
+        );
+        assert_eq!(j.0, ["repli false"]);
+        assert!(applis);
+
+        // refus passager : repli, sortie par défaut avec essai périodique ; essai réussi
+        let mut j = Journal::default();
+        let mut applis = false;
+        ecouter_applis(
+            &mut j,
+            &stop,
+            Err(refus(PASSAGER)),
+            |s: &mut Journal, retour| {
+                s.0.push("sortie".into());
+                // le flux de la sortie par défaut reste ouvert jusqu'à l'essai réussi
+                retour.expect("essai périodique").reussi = true;
+            },
+            |_| applis = true,
+        );
+        assert_eq!(j.0, ["lost", "repli true", "sortie", "repli false"]);
+        assert!(applis);
+
+        // refus définitif : sortie par défaut jusqu'à l'arrêt, sans essai ni retour
+        let mut j = Journal::default();
+        ecouter_applis(
+            &mut j,
+            &stop,
+            Err(refus(DEFINITIF)),
+            |s: &mut Journal, retour| {
+                assert!(retour.is_none());
+                s.0.push("sortie".into());
+                stop.store(true, Ordering::Relaxed);
+            },
+            |_| panic!("pas d'applis"),
+        );
+        assert_eq!(j.0, ["lost", "repli true", "sortie"]);
+    }
+
+    /// Attend jusqu'à 2 s que l'essai réussisse ; renvoie s'il a réussi.
+    fn essayer(e: &mut EssaiApplis, pendant: Duration) -> bool {
+        let debut = Instant::now();
+        while debut.elapsed() < pendant {
+            if e.avancer(Instant::now()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn essai_periodique_des_applis() {
+        static PASSAGERS: AtomicU32 = AtomicU32::new(0);
+        static DEFINITIFS: AtomicU32 = AtomicU32::new(0);
+        fn reussit_au_troisieme() -> anyhow::Result<()> {
+            if PASSAGERS.fetch_add(1, Ordering::Relaxed) < 2 {
+                Err(refus(PASSAGER))
+            } else {
+                Ok(())
+            }
+        }
+        fn jamais() -> anyhow::Result<()> {
+            DEFINITIFS.fetch_add(1, Ordering::Relaxed);
+            Err(refus(DEFINITIF))
+        }
+        let mut e = EssaiApplis::new(reussit_au_troisieme, Duration::from_millis(5));
+        assert!(essayer(&mut e, Duration::from_secs(2)));
+        assert_eq!(PASSAGERS.load(Ordering::Relaxed), 3);
+        assert!(e.avancer(Instant::now()), "la réussite reste acquise");
+        // pas d'essai avant l'intervalle
+        let mut e = EssaiApplis::new(reussit_au_troisieme, Duration::from_secs(60));
+        assert!(!essayer(&mut e, Duration::from_millis(30)));
+        assert!(e.fil.is_none());
+        // Windows ne connaît pas cette capture : un seul essai, puis abandon
+        let mut e = EssaiApplis::new(jamais, Duration::from_millis(5));
+        assert!(!essayer(&mut e, Duration::from_millis(200)));
+        assert_eq!(DEFINITIFS.load(Ordering::Relaxed), 1);
+        assert!(e.prochain.is_none());
+    }
+
+    #[test]
+    fn panique_du_fil_annoncee_comme_perte() {
+        let mut j = Journal::default();
+        assert!(sans_panique(&mut j, |s| s.open(48_000)));
+        assert_eq!(j.0, ["open 48000"]);
+        let mut j = Journal::default();
+        assert!(!sans_panique(&mut j, |s| {
+            s.open(48_000);
+            panic!("essai : panique voulue");
+        }));
+        assert_eq!(j.0, ["open 48000", "lost"]);
+        // une capture dont le fil s'est terminé n'est plus active
+        let c = Capture {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: Some(std::thread::spawn(|| {})),
+        };
+        let debut = Instant::now();
+        while c.actif() {
+            assert!(debut.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let c = capture_lente(Duration::ZERO);
+        assert!(c.actif());
+    }
 
     /// Capture factice dont le fil met `duree` à voir l'arrêt.
     fn capture_lente(duree: Duration) -> Capture {
