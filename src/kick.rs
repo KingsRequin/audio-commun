@@ -465,7 +465,8 @@ impl Analyzer {
     /// Ajoute des échantillons mono.
     pub fn push(&mut self, samples: &[f32]) {
         for &s in samples {
-            self.sample(s as f64);
+            // Un NaN figerait les filtres pour toujours : aucun kick ensuite.
+            self.sample(crate::echantillon_sain(s) as f64);
         }
     }
 

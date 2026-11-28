@@ -632,17 +632,18 @@ fn drain(
 }
 
 /// Stéréo f32 entrelacée (octets little-endian) → mono ; renvoie le niveau efficace (RMS) de
-/// chaque canal (gauche, droite). Les valeurs non finies ne comptent pas dans les niveaux.
+/// chaque canal (gauche, droite).
 fn mix_mono(stereo: &[u8], mono: &mut [f32]) -> (f32, f32) {
     mono_et_niveaux(trames(stereo), mono)
 }
 
-/// Stéréo f32 entrelacée (octets little-endian) → trames `[gauche, droite]`.
+/// Stéréo f32 entrelacée (octets little-endian) → trames `[gauche, droite]`, chaque échantillon
+/// passé par [`crate::echantillon_sain`] : aucun `Sink` ne reçoit de valeur non finie.
 fn trames(stereo: &[u8]) -> impl Iterator<Item = [f32; 2]> + '_ {
     stereo.chunks_exact(8).map(|fr| {
         [
-            f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]),
-            f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]),
+            crate::echantillon_sain(f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]])),
+            crate::echantillon_sain(f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]])),
         ]
     })
 }
@@ -652,9 +653,7 @@ fn mono_et_niveaux(trames: impl Iterator<Item = [f32; 2]>, mono: &mut [f32]) -> 
     let (mut sl, mut sr, mut n) = (0.0f32, 0.0f32, 0usize);
     for (m, [l, r]) in mono.iter_mut().zip(trames) {
         *m = 0.5 * (l + r);
-        if l.is_finite() && r.is_finite() {
-            (sl, sr) = (sl + l * l, sr + r * r);
-        }
+        (sl, sr) = (sl + l * l, sr + r * r);
         n += 1;
     }
     let n = n.max(1) as f32;
@@ -978,5 +977,23 @@ mod tests {
         // niveaux efficaces : √((1 + 0,25 + 1) / 3) à gauche, √((0 + 0,25 + 1) / 3) à droite
         assert!((g - (2.25f32 / 3.0).sqrt()).abs() < 1e-6, "{g}");
         assert!((d - (1.25f32 / 3.0).sqrt()).abs() < 1e-6, "{d}");
+    }
+
+    /// Une appli qui émet un NaN, un infini ou une valeur démesurée : remplacés avant le `Sink`,
+    /// les niveaux restent finis.
+    #[test]
+    fn echantillons_anormaux_remplaces() {
+        let mut stereo = Vec::new();
+        for (l, r) in [(f32::NAN, 0.5f32), (f32::INFINITY, f32::NEG_INFINITY), (1e30, -1e30)] {
+            stereo.extend_from_slice(&l.to_le_bytes());
+            stereo.extend_from_slice(&r.to_le_bytes());
+        }
+        let mut mono = [9.0f32; 3];
+        let (g, d) = mix_mono(&stereo, &mut mono);
+        assert_eq!(mono, [0.25, 0.0, 0.0]);
+        assert!(g.is_finite() && d.is_finite(), "{g} {d}");
+        let max = crate::ECHANTILLON_MAX;
+        // gauche : NaN et infini → 0, 1e30 → borne
+        assert!((g - (max * max / 3.0).sqrt()).abs() < 1e-4, "{g}");
     }
 }

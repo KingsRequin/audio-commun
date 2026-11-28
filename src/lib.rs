@@ -18,6 +18,23 @@
 //! du délai et une dépendance au lancement d'un autre programme, pour un gain négligeable
 //! (une capture loopback ne fait que lire le mélange déjà calculé par Windows).
 
+/// Amplitude maximale gardée d'un échantillon (+18 dB au-dessus de la pleine échelle : un mélange
+/// en flottants peut dépasser 1, jamais de loin). Au-delà, les carrés des calculs de puissance
+/// débordent en infini.
+pub const ECHANTILLON_MAX: f32 = 8.0;
+
+/// Échantillon ramené dans des bornes sûres, 0 s'il n'est pas fini. Une appli peut émettre un
+/// NaN ou un infini : un seul suffirait à bloquer pour toujours les filtres et les moyennes
+/// glissantes de l'analyse. Sans effet sur un son normal.
+#[inline]
+pub fn echantillon_sain(x: f32) -> f32 {
+    if x.is_finite() {
+        x.clamp(-ECHANTILLON_MAX, ECHANTILLON_MAX)
+    } else {
+        0.0
+    }
+}
+
 #[cfg(feature = "capture")]
 pub mod capture;
 pub mod kick;

@@ -480,17 +480,16 @@ impl Analyzer {
         }
     }
 
-    /// Ajoute des échantillons mono à la fenêtre glissante.
+    /// Ajoute des échantillons mono à la fenêtre glissante (passés par
+    /// [`crate::echantillon_sain`] : un infini laisserait le volume à NaN tant qu'il y reste).
     pub fn push(&mut self, samples: &[f32]) {
         self.drums.push(samples);
         let n = self.ring.len();
-        let mut s = samples;
-        if s.len() > n {
-            s = &s[s.len() - n..];
-        }
-        let first = (n - self.pos).min(s.len());
-        self.ring[self.pos..self.pos + first].copy_from_slice(&s[..first]);
-        self.ring[..s.len() - first].copy_from_slice(&s[first..]);
+        let s = &samples[samples.len().saturating_sub(n)..];
+        let (debut, fin) = s.split_at((n - self.pos).min(s.len()));
+        let sain = |(d, x): (&mut f32, &f32)| *d = crate::echantillon_sain(*x);
+        self.ring[self.pos..self.pos + debut.len()].iter_mut().zip(debut).for_each(sain);
+        self.ring[..fin.len()].iter_mut().zip(fin).for_each(sain);
         self.pos = (self.pos + s.len()) % n;
     }
 
@@ -736,6 +735,27 @@ mod tests {
     fn kick(t: f32, period: f32) -> f32 {
         let tk = t % period;
         0.8 * (-tk / 0.08).exp() * (2.0 * PI * 55.0 * tk).sin()
+    }
+
+    /// Une appli émet un échantillon non fini ou démesuré : l'analyse (grosse caisse comprise)
+    /// suit encore le son ensuite, sans valeur non finie. Avant, un NaN arrêtait pour toujours
+    /// le détecteur appris, et un infini ou 1e30 laissait le volume à NaN.
+    #[test]
+    fn un_echantillon_anormal_ne_bloque_pas_l_analyse() {
+        let casse = (3 * SR) as usize + 10;
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30] {
+            let (o, kicks, _) = run(8.0, |t| {
+                if (t * SR as f32).round() as usize == casse {
+                    v
+                } else {
+                    kick(t, 0.5) + 0.05 * (2.0 * PI * 3000.0 * t).sin()
+                }
+            });
+            assert!(o.all_finite(), "{v} : {o:?}");
+            assert!(o.volume > 0.0, "{v} : le volume suit le son");
+            let apres = kicks.iter().filter(|&&t| t > 3.2).count();
+            assert!(apres >= 8, "{v} : {apres} grosses caisses en 4,8 s");
+        }
     }
 
     #[test]

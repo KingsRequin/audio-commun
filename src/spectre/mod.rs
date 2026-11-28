@@ -65,7 +65,8 @@ pub struct AudioFeatures {
 }
 
 impl AudioFeatures {
-    /// Remet les niveaux à zéro (silence, capture interrompue) sans toucher aux compteurs.
+    /// Remet les niveaux à zéro (silence, capture interrompue) sans toucher aux compteurs. Le
+    /// timbre et la tonalité gardent leur dernière valeur, sauf si elle n'est pas finie.
     pub fn quiet(&mut self) {
         self.bands.iter_mut().for_each(|b| *b = 0.0);
         (self.volume, self.bass, self.mid, self.treble) = (0.0, 0.0, 0.0, 0.0);
@@ -74,6 +75,99 @@ impl AudioFeatures {
         (self.bpm, self.beat_phase, self.tempo_confidence) = (0.0, 0.0, 0.0);
         self.intensity = 0.5;
         self.silent = true;
+        for v in [&mut self.centroid, &mut self.tone, &mut self.tone_strength] {
+            if !v.is_finite() {
+                *v = 0.0;
+            }
+        }
+    }
+
+    /// Toutes les valeurs flottantes sont finies. Déstructuration complète : un champ ajouté
+    /// doit être examiné ici (et dans [`AudioFeatures::quiet`]).
+    pub fn all_finite(&self) -> bool {
+        let AudioFeatures {
+            bands,
+            volume,
+            bass,
+            mid,
+            treble,
+            kick,
+            snare,
+            hihat,
+            kicks: _,
+            snares: _,
+            hihats: _,
+            beats: _,
+            bpm,
+            beat_phase,
+            tempo_confidence,
+            intensity,
+            drops: _,
+            centroid,
+            tone,
+            tone_strength,
+            silent: _,
+            kick_hits: _,
+            kick_bass,
+        } = self;
+        bands.iter().all(|b| b.is_finite())
+            && [
+                volume,
+                bass,
+                mid,
+                treble,
+                kick,
+                snare,
+                hihat,
+                bpm,
+                beat_phase,
+                tempo_confidence,
+                intensity,
+                centroid,
+                tone,
+                tone_strength,
+                kick_bass,
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+}
+
+/// Durée pendant laquelle l'analyse peut rendre des valeurs non finies avant d'être relancée.
+#[cfg(feature = "capture")]
+const RELANCE_NAN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Garde-fou des images d'analyse : celles qui ne sont pas finies sont publiées comme du
+/// silence (compteurs gardés), et l'analyse est relancée quand cela dure plus de [`RELANCE_NAN`].
+/// Les échantillons sont déjà nettoyés à l'entrée : il ne sert que si un calcul déraille.
+#[cfg(feature = "capture")]
+#[derive(Default)]
+struct GardeNan {
+    /// Première image non finie de la série en cours.
+    depuis: Option<std::time::Instant>,
+    /// Dernier avertissement écrit au journal (au plus un par minute).
+    averti: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "capture")]
+impl GardeNan {
+    /// Neutralise `f` s'il n'est pas fini ; `true` quand l'analyse doit être relancée.
+    fn verifier(&mut self, f: &mut AudioFeatures, now: std::time::Instant) -> bool {
+        if f.all_finite() {
+            self.depuis = None;
+            return false;
+        }
+        f.quiet();
+        let depuis = *self.depuis.get_or_insert(now);
+        if now.duration_since(depuis) < RELANCE_NAN {
+            return false;
+        }
+        self.depuis = None;
+        if self.averti.is_none_or(|t| now.duration_since(t).as_secs() >= 60) {
+            self.averti = Some(now);
+            log::warn!("analyse audio : valeurs non finies depuis 1 s, analyse relancée");
+        }
+        true
     }
 }
 
@@ -135,10 +229,12 @@ pub fn start(
     let sink = Runner {
         dt: std::time::Duration::from_secs_f32(1.0 / opts.rate),
         opts,
+        sample_rate: 0,
         analyzer: None,
         features: AudioFeatures::default(),
         next_tick: std::time::Instant::now(),
         out,
+        garde: GardeNan::default(),
     };
     Ok(crate::capture::start(name, sink)?)
 }
@@ -148,14 +244,20 @@ pub fn start(
 struct Runner {
     opts: Options,
     dt: std::time::Duration,
+    sample_rate: u32,
     analyzer: Option<Analyzer>,
     features: AudioFeatures,
     next_tick: std::time::Instant,
     out: std::sync::Arc<std::sync::Mutex<AudioFeatures>>,
+    garde: GardeNan,
 }
 
 #[cfg(feature = "capture")]
 impl Runner {
+    fn nouvel_analyseur(&self) -> Analyzer {
+        Analyzer::new(self.sample_rate, self.opts.bands, self.opts.rate)
+    }
+
     fn publish(&self) {
         if let Ok(mut f) = self.out.lock() {
             f.clone_from(&self.features); // réutilise la capacité de `bands`
@@ -166,7 +268,8 @@ impl Runner {
 #[cfg(feature = "capture")]
 impl crate::capture::Sink for Runner {
     fn open(&mut self, sample_rate: u32) {
-        self.analyzer = Some(Analyzer::new(sample_rate, self.opts.bands, self.opts.rate));
+        self.sample_rate = sample_rate;
+        self.analyzer = Some(self.nouvel_analyseur());
         self.next_tick = std::time::Instant::now() + self.dt;
     }
 
@@ -186,6 +289,9 @@ impl crate::capture::Sink for Runner {
         if now >= self.next_tick {
             if let Some(a) = &mut self.analyzer {
                 a.analyze(&mut self.features);
+                if self.garde.verifier(&mut self.features, now) {
+                    self.analyzer = Some(self.nouvel_analyseur());
+                }
                 self.publish();
             }
             self.next_tick += self.dt;
@@ -200,5 +306,60 @@ impl crate::capture::Sink for Runner {
         // Plus de données : les consommateurs doivent voir du silence pendant la reconnexion.
         self.features.quiet();
         self.publish();
+    }
+}
+
+#[cfg(all(test, feature = "capture"))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Caractéristiques dont toutes les valeurs flottantes sont NaN.
+    fn toutes_nan() -> AudioFeatures {
+        let n = f32::NAN;
+        AudioFeatures {
+            bands: vec![n; 4],
+            volume: n,
+            bass: n,
+            mid: n,
+            treble: n,
+            kick: n,
+            snare: n,
+            hihat: n,
+            kicks: 3,
+            beats: 7,
+            bpm: n,
+            beat_phase: n,
+            tempo_confidence: n,
+            intensity: n,
+            centroid: n,
+            tone: n,
+            tone_strength: n,
+            kick_bass: n,
+            ..AudioFeatures::default()
+        }
+    }
+
+    /// Images non finies : publiées comme du silence (compteurs gardés) aussitôt, relance
+    /// demandée une fois qu'elles durent depuis `RELANCE_NAN`, série oubliée dès une image finie.
+    #[test]
+    fn garde_neutralise_puis_relance() {
+        let mut g = GardeNan::default();
+        let t0 = Instant::now();
+        let mut f = toutes_nan();
+        assert!(!g.verifier(&mut f, t0));
+        assert!(f.all_finite() && f.silent && f.volume == 0.0);
+        assert_eq!((f.kicks, f.beats), (3, 7), "compteurs gardés");
+        let mut f = toutes_nan();
+        assert!(!g.verifier(&mut f, t0 + RELANCE_NAN / 2));
+        let mut f = toutes_nan();
+        assert!(g.verifier(&mut f, t0 + RELANCE_NAN), "relance");
+        assert!(f.all_finite());
+        let mut f = toutes_nan();
+        assert!(!g.verifier(&mut f, t0 + RELANCE_NAN * 2));
+        let mut fini = AudioFeatures::default();
+        assert!(!g.verifier(&mut fini, t0 + RELANCE_NAN * 3));
+        let mut f = toutes_nan();
+        assert!(!g.verifier(&mut f, t0 + RELANCE_NAN * 4), "série interrompue : délai repris");
     }
 }

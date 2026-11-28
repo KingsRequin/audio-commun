@@ -110,6 +110,17 @@ Le son est remis au `Sink` en mono, mais `Sink::stereo(gauche, droite)` reçoit 
 efficace (RMS) de chaque canal : de quel côté joue le son. Méthode facultative (vide par défaut) ; Essaim
 s'en sert pour pousser l'essaim vers le côté qui joue le plus fort.
 
+## Son anormal (0.7.4)
+
+Une appli peut émettre un échantillon NaN, infini ou démesuré. Avant la 0.7.4, un seul suffisait à arrêter pour
+toujours le détecteur appris de `kick` (filtres figés à NaN), et un infini laissait le volume de `spectre` à NaN.
+Chaque échantillon passe maintenant par `echantillon_sain` (0 s'il n'est pas fini, borné à ±`ECHANTILLON_MAX`,
++18 dB) : à la lecture de la capture, donc avant tout `Sink`, et à l'entrée de `kick::Analyzer::push` et de
+`spectre::Analyzer::push` pour un son venu d'ailleurs. Sans effet sur un son normal : un échantillon fini sous la borne passe tel quel.
+`spectre::start` publie en plus comme du silence une image d'analyse non finie et relance l'analyse si cela dure
+une seconde (`AudioFeatures::all_finite`) ; `AudioFeatures::quiet` remet aussi à 0 un timbre ou une tonalité non
+finis.
+
 ## Tempo des kicks (`pulsation`, 0.2.0)
 
 `Pulsation` déduit le tempo des seuls instants des kicks, pour une application qui n'a pas la FFT
