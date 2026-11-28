@@ -258,10 +258,11 @@ impl Runner {
         Analyzer::new(self.sample_rate, self.opts.bands, self.opts.rate)
     }
 
+    /// Recopie l'image dans `out`, même si un consommateur a paniqué en tenant le verrou (sinon
+    /// l'analyse cesserait d'être publiée pour toujours).
     fn publish(&self) {
-        if let Ok(mut f) = self.out.lock() {
-            f.clone_from(&self.features); // réutilise la capacité de `bands`
-        }
+        let mut f = self.out.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.clone_from(&self.features); // réutilise la capacité de `bands`
     }
 }
 
